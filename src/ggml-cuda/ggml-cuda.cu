@@ -2649,7 +2649,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             GGML_ASSERT(ggml_cuda_op_regular_hadamard(ctx, dst->src[0], dst, ggml_get_op_params_i32(dst, 0)));
             break;
         case GGML_OP_QUANTIZE_I8_CONVROT:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             GGML_ASSERT(ggml_cuda_op_quantize_i8_convrot(ctx, dst->src[0], dst, ggml_get_op_params_i32(dst, 0)));
+#else
+            GGML_ABORT("INT8 convrot quantization is only implemented for CUDA");
+#endif
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -5649,6 +5653,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        (group_size == 4 || group_size == 16 || group_size == 64 || group_size == 256);
             }
         case GGML_OP_QUANTIZE_I8_CONVROT:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             {
                 const ggml_tensor * src = op->src[0];
                 const int group_size    = ggml_get_op_params_i32(op, 0);
@@ -5662,6 +5667,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        group_size == 256 && src->ne[0] % group_size == 0 &&
                        op->ne[0] == src->ne[0] && op->ne[1] == rows_padded + scale_rows;
             }
+#else
+            return false;
+#endif
 
         default:
             return false;
