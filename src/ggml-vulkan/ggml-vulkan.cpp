@@ -6609,7 +6609,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_device_fault");
         }
 
-        vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
+        ggml_vk_default_dispatcher().vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
 
         device->device_fault = device->device_fault && fault_features.deviceFault;
 
@@ -7239,7 +7239,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     }
 #endif
 
-    vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
+    ggml_vk_default_dispatcher().vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
 
     fp16 = fp16 && vk12_features.shaderFloat16;
 
@@ -18780,7 +18780,7 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
     vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     device_features2.pNext = &vk11_features;
 
-    vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
+    ggml_vk_default_dispatcher().vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
 
     return vk11_features.storageBuffer16BitAccess;
 }
