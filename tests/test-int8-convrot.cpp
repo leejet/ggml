@@ -38,8 +38,9 @@ static float regular_hadamard_reference(const std::vector<float> & input, int ou
 
 int main(int argc, char ** argv) {
     const bool use_cuda = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
-    if (argc > 2 || (argc == 2 && !use_cuda)) {
-        std::fprintf(stderr, "usage: %s [--cuda]\n", argv[0]);
+    const bool use_vulkan = argc == 2 && std::strcmp(argv[1], "--vulkan") == 0;
+    if (argc > 2 || (argc == 2 && !use_cuda && !use_vulkan)) {
+        std::fprintf(stderr, "usage: %s [--cuda|--vulkan]\n", argv[0]);
         return 1;
     }
 
@@ -60,7 +61,7 @@ int main(int argc, char ** argv) {
     ggml_tensor * b256 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_tensor * q256 = ggml_quantize_i8_convrot(ctx, x256, 256);
     ggml_tensor * fused256 = ggml_mul_mat_i8_tensorwise(ctx, w256, q256, ws256, b256, 256);
-    const int large_k    = 256;
+    const int large_k    = 512;
     const int large_n    = 128;
     const int large_rows = 65;
     ggml_tensor * x_large  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, large_k, large_rows);
@@ -72,32 +73,36 @@ int main(int argc, char ** argv) {
     ggml_tensor * fused_large_no_bias = ggml_mul_mat_i8_tensorwise(ctx, w_large, q_large, ws_large, nullptr, 256);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, out);
-    ggml_build_forward_expand(graph, r256);
+    if (!use_vulkan) {
+        ggml_build_forward_expand(graph, out);
+        ggml_build_forward_expand(graph, r256);
+    }
     ggml_build_forward_expand(graph, fused256);
     ggml_build_forward_expand(graph, fused_large);
     ggml_build_forward_expand(graph, fused_large_no_bias);
 
     ggml_backend_t backend = nullptr;
-    if (use_cuda) {
+    if (use_cuda || use_vulkan) {
+        const char * backend_name = use_cuda ? "CUDA" : "Vulkan";
         ggml_backend_load_all();
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t device = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-                std::strstr(ggml_backend_dev_name(device), "CUDA") != nullptr) {
+                std::strstr(ggml_backend_dev_name(device), backend_name) != nullptr) {
                 backend = ggml_backend_dev_init(device, nullptr);
                 break;
             }
         }
         if (backend == nullptr) {
-            std::fprintf(stderr, "CUDA backend not found\n");
+            std::fprintf(stderr, "%s backend not found\n", backend_name);
             return 1;
         }
     } else {
         backend = ggml_backend_cpu_init();
         ggml_backend_cpu_set_n_threads(backend, 2);
     }
-    if (!ggml_backend_supports_op(backend, fused_large) ||
+    if (!ggml_backend_supports_op(backend, q_large) ||
+        !ggml_backend_supports_op(backend, fused_large) ||
         !ggml_backend_supports_op(backend, fused_large_no_bias)) {
         std::fprintf(stderr, "backend does not report packed INT8 convrot matmul support\n");
         return 1;
@@ -158,28 +163,35 @@ int main(int argc, char ** argv) {
 
     std::vector<float> rot_data(ggml_nelements(rot));
     std::vector<float> out_data(ggml_nelements(out));
-    ggml_backend_tensor_get(rot, rot_data.data(), 0, ggml_nbytes(rot));
-    ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
+    if (!use_vulkan) {
+        ggml_backend_tensor_get(rot, rot_data.data(), 0, ggml_nbytes(rot));
+        ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
+    }
 
     const std::vector<float> expected_rot = {
         1.0f, 2.0f, 3.0f, 4.0f,
         2.25f, -2.75f, -1.25f, 0.25f,
     };
-    for (size_t i = 0; i < expected_rot.size(); ++i) {
-        if (!nearly_equal(rot_data[i], expected_rot[i])) {
-            std::fprintf(stderr, "regular Hadamard mismatch at %zu: %.8f != %.8f\n", i, rot_data[i], expected_rot[i]);
-            return 1;
+    if (!use_vulkan) {
+        for (size_t i = 0; i < expected_rot.size(); ++i) {
+            if (!nearly_equal(rot_data[i], expected_rot[i])) {
+                std::fprintf(stderr, "regular Hadamard mismatch at %zu: %.8f != %.8f\n", i, rot_data[i], expected_rot[i]);
+                return 1;
+            }
         }
     }
 
     std::vector<float> r256_data(ggml_nelements(r256));
-    ggml_backend_tensor_get(r256, r256_data.data(), 0, ggml_nbytes(r256));
+    if (!use_vulkan) {
+        ggml_backend_tensor_get(r256, r256_data.data(), 0, ggml_nbytes(r256));
+    }
     for (int i = 0; i < 256; ++i) {
         const float expected = regular_hadamard_reference(x256_data, i);
-        if (!nearly_equal(r256_data[i], expected)) {
+        if (!use_vulkan && !nearly_equal(r256_data[i], expected)) {
             std::fprintf(stderr, "regular Hadamard-256 mismatch at %d: %.8f != %.8f\n", i, r256_data[i], expected);
             return 1;
         }
+        r256_data[i] = expected;
     }
 
     float fused_amax = 0.0f;
@@ -275,16 +287,18 @@ int main(int argc, char ** argv) {
         }
     }
 
-    for (size_t i = 0; i < expected_out.size(); ++i) {
-        if (!nearly_equal(out_data[i], expected_out[i])) {
-            std::fprintf(stderr, "INT8 matmul mismatch at %zu: %.8f != %.8f\n", i, out_data[i], expected_out[i]);
-            return 1;
+    if (!use_vulkan) {
+        for (size_t i = 0; i < expected_out.size(); ++i) {
+            if (!nearly_equal(out_data[i], expected_out[i])) {
+                std::fprintf(stderr, "INT8 matmul mismatch at %zu: %.8f != %.8f\n", i, out_data[i], expected_out[i]);
+                return 1;
+            }
         }
     }
 
     ggml_backend_buffer_free(buffer);
     ggml_backend_free(backend);
     ggml_free(ctx);
-    std::printf("INT8 convrot %s test passed\n", use_cuda ? "CUDA" : "CPU");
+    std::printf("INT8 convrot %s test passed\n", use_cuda ? "CUDA" : (use_vulkan ? "Vulkan" : "CPU"));
     return 0;
 }
