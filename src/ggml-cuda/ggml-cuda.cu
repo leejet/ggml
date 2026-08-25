@@ -1377,12 +1377,14 @@ __global__ void quantize_rowwise_i8_cuda(const float * src, int8_t * dst, float 
     }
 }
 
+template <int group_size>
 __global__ void quantize_rowwise_i8_convrot_cuda(
         const float * src, int8_t * dst, float * scales,
         int64_t k, int64_t rows, int64_t dst_stride) {
-    constexpr int group_size      = 256;
     constexpr int group_threads   = group_size / 4;
     constexpr int groups_per_wave = 1024 / group_threads;
+    // H4 carries a 1/2 normalization, applied log4(group_size) times.
+    constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
 
     const int64_t row = blockIdx.x;
     const int tid     = threadIdx.x;
@@ -1396,7 +1398,7 @@ __global__ void quantize_rowwise_i8_convrot_cuda(
     int8_t * dst_row      = dst + row * dst_stride;
 
     for (int64_t i = tid; i < k; i += blockDim.x) {
-        values[i] = src_row[i] * (1.0f / 16.0f);
+        values[i] = src_row[i] * hadamard_norm;
     }
     __syncthreads();
 
@@ -1466,27 +1468,32 @@ __global__ void quantize_rowwise_i8_convrot_cuda(
     }
 }
 
+template <int group_size>
 __global__ void convrot_group_amax_i8_cuda(
         const float * src, float * partial_max, int64_t k, int64_t groups, int64_t total_groups) {
+    constexpr int group_threads = group_size / 4;
+    // H4 carries a 1/2 normalization, applied log4(group_size) times.
+    constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
+
     const int64_t index = blockIdx.x;
     const int tid       = threadIdx.x;
     if (index >= total_groups) {
         return;
     }
 
-    __shared__ float values[256];
-    __shared__ float maxima[2];
+    __shared__ float values[group_size];
+    __shared__ float maxima[group_threads];
     const int64_t row   = index / groups;
     const int64_t group = index - row * groups;
-    const float * input = src + row * k + group * 256;
-    values[tid]       = input[tid] * (1.0f / 16.0f);
-    values[tid + 64]  = input[tid + 64] * (1.0f / 16.0f);
-    values[tid + 128] = input[tid + 128] * (1.0f / 16.0f);
-    values[tid + 192] = input[tid + 192] * (1.0f / 16.0f);
+    const float * input = src + row * k + group * group_size;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        values[tid + j * group_threads] = input[tid + j * group_threads] * hadamard_norm;
+    }
     __syncthreads();
 
 #pragma unroll
-    for (int stride = 1; stride < 256; stride *= 4) {
+    for (int stride = 1; stride < group_size; stride *= 4) {
         const int base   = (tid / stride) * 4 * stride + tid % stride;
         const int i0     = base;
         const int i1     = i0 + stride;
@@ -1503,18 +1510,21 @@ __global__ void convrot_group_amax_i8_cuda(
         __syncthreads();
     }
 
-    float value = fmaxf(fabsf(values[tid]), fabsf(values[tid + 64]));
-    value       = fmaxf(value, fabsf(values[tid + 128]));
-    value       = fmaxf(value, fabsf(values[tid + 192]));
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+    float value = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        value = fmaxf(value, fabsf(values[tid + j * group_threads]));
     }
-    if ((tid & 31) == 0) {
-        maxima[tid >> 5] = value;
-    }
+    maxima[tid] = value;
     __syncthreads();
+    for (int stride = group_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            maxima[tid] = fmaxf(maxima[tid], maxima[tid + stride]);
+        }
+        __syncthreads();
+    }
     if (tid == 0) {
-        partial_max[index] = fmaxf(maxima[0], maxima[1]);
+        partial_max[index] = maxima[0];
     }
 }
 
@@ -1544,28 +1554,33 @@ __global__ void reduce_convrot_row_amax_i8_cuda(
     }
 }
 
+template <int group_size>
 __global__ void convrot_group_quantize_i8_cuda(
         const float * src, int8_t * dst, const float * scales,
         int64_t k, int64_t groups, int64_t total_groups, int64_t dst_stride) {
+    constexpr int group_threads = group_size / 4;
+    // H4 carries a 1/2 normalization, applied log4(group_size) times.
+    constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
+
     const int64_t index = blockIdx.x;
     const int tid       = threadIdx.x;
     if (index >= total_groups) {
         return;
     }
 
-    __shared__ float values[256];
+    __shared__ float values[group_size];
     const int64_t row   = index / groups;
     const int64_t group = index - row * groups;
-    const float * input = src + row * k + group * 256;
-    int8_t * output     = dst + row * dst_stride + group * 256;
-    values[tid]       = input[tid] * (1.0f / 16.0f);
-    values[tid + 64]  = input[tid + 64] * (1.0f / 16.0f);
-    values[tid + 128] = input[tid + 128] * (1.0f / 16.0f);
-    values[tid + 192] = input[tid + 192] * (1.0f / 16.0f);
+    const float * input = src + row * k + group * group_size;
+    int8_t * output     = dst + row * dst_stride + group * group_size;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        values[tid + j * group_threads] = input[tid + j * group_threads] * hadamard_norm;
+    }
     __syncthreads();
 
 #pragma unroll
-    for (int stride = 1; stride < 256; stride *= 4) {
+    for (int stride = 1; stride < group_size; stride *= 4) {
         const int base   = (tid / stride) * 4 * stride + tid % stride;
         const int i0     = base;
         const int i1     = i0 + stride;
@@ -1584,12 +1599,12 @@ __global__ void convrot_group_quantize_i8_cuda(
 
     const float row_scale = scales[row];
     const float inv_scale = row_scale == 0.0f ? 0.0f : 1.0f / row_scale;
-    const int indices[4]  = { tid, tid + 64, tid + 128, tid + 192 };
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int value = row_scale == 0.0f ? 0 : __float2int_rn(values[indices[i]] * inv_scale);
+    for (int j = 0; j < 4; ++j) {
+        const int element = tid + j * group_threads;
+        int value = row_scale == 0.0f ? 0 : __float2int_rn(values[element] * inv_scale);
         value     = max(-127, min(127, value));
-        output[indices[i]] = (int8_t)value;
+        output[element] = (int8_t)value;
     }
     if (group == 0 && tid == 0 && dst_stride != k) {
         *((float *)(dst + row * dst_stride + k)) = row_scale;
@@ -1623,7 +1638,8 @@ static void ggml_cuda_quantize_i8_convrot(
         int64_t k,
         int64_t rows,
         int64_t rows_padded,
-        int64_t dst_stride) {
+        int64_t dst_stride,
+        int group_size) {
     cudaStream_t stream = ctx.stream();
     if (rows_padded > rows) {
         CUDA_CHECK(cudaMemsetAsync(
@@ -1633,26 +1649,43 @@ static void ggml_cuda_quantize_i8_convrot(
     const size_t nbytes_shared = (size_t)k * sizeof(float);
     const size_t smpbo         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
     if (nbytes_shared + 128 <= smpbo) {
-        CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda, smpbo - 128);
-        quantize_rowwise_i8_convrot_cuda<<<rows, 1024, nbytes_shared, stream>>>(
-            src, dst, scales, k, rows, dst_stride);
+        if (group_size == 64) {
+            CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda<64>, smpbo - 128);
+            quantize_rowwise_i8_convrot_cuda<64><<<rows, 1024, nbytes_shared, stream>>>(
+                src, dst, scales, k, rows, dst_stride);
+        } else {
+            CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda<256>, smpbo - 128);
+            quantize_rowwise_i8_convrot_cuda<256><<<rows, 1024, nbytes_shared, stream>>>(
+                src, dst, scales, k, rows, dst_stride);
+        }
         return;
     }
 
-    const int64_t groups       = k / 256;
+    const int64_t groups       = k / group_size;
     const int64_t total_groups = rows * groups;
+    const int group_threads    = group_size / 4;
     ggml_cuda_pool_alloc<float> partial_max(ctx.pool(), total_groups);
     ggml_cuda_pool_alloc<float> packed_scales(ctx.pool());
     float * scales_d = scales;
     if (scales_d == nullptr) {
         scales_d = packed_scales.alloc(rows);
     }
-    convrot_group_amax_i8_cuda<<<total_groups, 64, 0, stream>>>(
-        src, partial_max.get(), k, groups, total_groups);
+    if (group_size == 64) {
+        convrot_group_amax_i8_cuda<64><<<total_groups, group_threads, 0, stream>>>(
+            src, partial_max.get(), k, groups, total_groups);
+    } else {
+        convrot_group_amax_i8_cuda<256><<<total_groups, group_threads, 0, stream>>>(
+            src, partial_max.get(), k, groups, total_groups);
+    }
     reduce_convrot_row_amax_i8_cuda<<<rows, 256, 0, stream>>>(
         partial_max.get(), scales_d, groups, rows);
-    convrot_group_quantize_i8_cuda<<<total_groups, 64, 0, stream>>>(
-        src, dst, scales_d, k, groups, total_groups, dst_stride);
+    if (group_size == 64) {
+        convrot_group_quantize_i8_cuda<64><<<total_groups, group_threads, 0, stream>>>(
+            src, dst, scales_d, k, groups, total_groups, dst_stride);
+    } else {
+        convrot_group_quantize_i8_cuda<256><<<total_groups, group_threads, 0, stream>>>(
+            src, dst, scales_d, k, groups, total_groups, dst_stride);
+    }
 }
 
 static bool ggml_cuda_op_quantize_i8_convrot(
@@ -1665,7 +1698,7 @@ static bool ggml_cuda_op_quantize_i8_convrot(
     const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + src->ne[0] - 1) / src->ne[0];
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I8 ||
         !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
-        group_size != 256 || src->ne[0] % group_size != 0 ||
+        (group_size != 64 && group_size != 256) || src->ne[0] % group_size != 0 ||
         dst->ne[0] != src->ne[0] || dst->ne[1] != rows_padded + scale_rows) {
         return false;
     }
@@ -1679,7 +1712,8 @@ static bool ggml_cuda_op_quantize_i8_convrot(
         src->ne[0],
         rows,
         rows_padded,
-        src->ne[0]);
+        src->ne[0],
+        group_size);
     return true;
 }
 
@@ -1707,7 +1741,7 @@ static void ggml_cuda_mul_mat_i8(
     GGML_ASSERT(src1->ne[0] == k);
     GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
                                   src1->ne[1] == rows_padded + scale_rows));
-    GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 256);
+    GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 64 || convrot_group_size == 256);
 
     ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
     ggml_cuda_pool_alloc<float> scales(ctx.pool());
@@ -1727,7 +1761,7 @@ static void ggml_cuda_mul_mat_i8(
             (const float *)src1->data, qdata_d, scales_d, k, rows);
     } else {
         ggml_cuda_quantize_i8_convrot(
-            ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k);
+            ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k, convrot_group_size);
     }
 
     const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
@@ -5259,7 +5293,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (bias == nullptr ||
                             (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
                              ggml_nelements(bias) == a->ne[1])) &&
-                           (convrot_group_size == 0 || (convrot_group_size == 256 && a->ne[0] % 256 == 0)) &&
+                           (convrot_group_size == 0 ||
+                            ((convrot_group_size == 64 || convrot_group_size == 256) &&
+                             a->ne[0] % convrot_group_size == 0)) &&
                            (turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
                             amd_wmma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
                             amd_mfma_available(ggml_cuda_info().devices[dev_ctx->device].cc));
@@ -5653,7 +5689,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     : 0;
                 return src != nullptr && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
                        ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
-                       group_size == 256 && src->ne[0] % group_size == 0 &&
+                       (group_size == 64 || group_size == 256) && src->ne[0] % group_size == 0 &&
                        op->ne[0] == src->ne[0] && op->ne[1] == rows_padded + scale_rows;
             }
 #else
