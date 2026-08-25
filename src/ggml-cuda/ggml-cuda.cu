@@ -1333,7 +1333,7 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 __global__ void quantize_rowwise_i8_cuda(const float * src, int8_t * dst, float * scales, int64_t k, int64_t rows) {
     const int64_t row = blockIdx.x;
     const int tid     = threadIdx.x;
@@ -2237,10 +2237,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (src0->type == GGML_TYPE_I8) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
         ggml_cuda_mul_mat_i8(ctx, src0, src1, dst);
 #else
-        GGML_ABORT("INT8 tensorwise matmul is only implemented for CUDA");
+        GGML_ABORT("INT8 tensorwise matmul is only implemented for CUDA and HIP");
 #endif
         return;
     }
@@ -2646,10 +2646,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
         case GGML_OP_QUANTIZE_I8_CONVROT:
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
             GGML_ASSERT(ggml_cuda_op_quantize_i8_convrot(ctx, dst->src[0], dst, ggml_get_op_params_i32(dst, 0)));
 #else
-            GGML_ABORT("INT8 convrot quantization is only implemented for CUDA");
+            GGML_ABORT("INT8 convrot quantization is only implemented for CUDA and HIP");
 #endif
             break;
         case GGML_OP_OUT_PROD:
@@ -5236,7 +5236,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
                 if (a->type == GGML_TYPE_I8) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
                     const ggml_tensor * weight_scale = op->src[2];
                     const ggml_tensor * bias         = op->src[3];
                     const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
@@ -5260,7 +5260,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
                              ggml_nelements(bias) == a->ne[1])) &&
                            (convrot_group_size == 0 || (convrot_group_size == 256 && a->ne[0] % 256 == 0)) &&
-                           turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc);
+                           (turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
+                            amd_wmma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
+                            amd_mfma_available(ggml_cuda_info().devices[dev_ctx->device].cc));
 #else
                     return false;
 #endif
@@ -5640,7 +5642,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_QUANTIZE_I8_CONVROT:
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
             {
                 const ggml_tensor * src = op->src[0];
                 const int group_size    = ggml_get_op_params_i32(op, 0);
