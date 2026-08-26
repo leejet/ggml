@@ -11,6 +11,54 @@ const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
 
+struct ggml_fp8_e4m3_cuda {
+    uint8_t value;
+
+    __device__ operator float() const {
+        const uint32_t sign     = value >> 7;
+        const uint32_t exponent = (value >> 3) & 0x0f;
+        const uint32_t mantissa = value & 0x07;
+
+        if (exponent == 0x0f && mantissa == 0x07) {
+            return sign ? -nanf("") : nanf("");
+        }
+
+        float result;
+        if (exponent == 0) {
+            result = ldexpf((float) mantissa, -9);
+        } else {
+            result = ldexpf(1.0f + (float) mantissa / 8.0f, (int) exponent - 7);
+        }
+        return sign ? -result : result;
+    }
+};
+
+struct ggml_fp8_e5m2_cuda {
+    uint8_t value;
+
+    __device__ operator float() const {
+        const uint32_t sign     = value >> 7;
+        const uint32_t exponent = (value >> 2) & 0x1f;
+        const uint32_t mantissa = value & 0x03;
+
+        if (exponent == 0x1f) {
+            const float result = mantissa == 0 ? INFINITY : nanf("");
+            return sign ? -result : result;
+        }
+
+        float result;
+        if (exponent == 0) {
+            result = ldexpf((float) mantissa, -16);
+        } else {
+            result = ldexpf(1.0f + (float) mantissa / 4.0f, (int) exponent - 15);
+        }
+        return sign ? -result : result;
+    }
+};
+
+static_assert(sizeof(ggml_fp8_e4m3_cuda) == 1, "unexpected E4M3 storage size");
+static_assert(sizeof(ggml_fp8_e5m2_cuda) == 1, "unexpected E5M2 storage size");
+
 template <cpy_kernel_t cpy_1>
 static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne,
                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -476,6 +524,38 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F16) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_cuda, half>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_cuda, half>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E5M2 && src1->type == GGML_TYPE_F16) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e5m2_cuda, half>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e5m2_cuda, half>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_BF16) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_cuda, nv_bfloat16>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_cuda, nv_bfloat16>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E5M2 && src1->type == GGML_TYPE_BF16) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e5m2_cuda, nv_bfloat16>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e5m2_cuda, nv_bfloat16>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
