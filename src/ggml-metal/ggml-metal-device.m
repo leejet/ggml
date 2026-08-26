@@ -1427,6 +1427,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             default:
                                 return false;
                         }
+                    case GGML_TYPE_F8_E4M3:
+                    case GGML_TYPE_F8_E5M2:
+                        return op->type == GGML_TYPE_F16 || (op->type == GGML_TYPE_BF16 && has_bfloat);
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:

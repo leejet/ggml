@@ -1859,6 +1859,47 @@ float bf16_to_fp32(uint32_t u)
     return uintBitsToFloat(u << 16);
 }
 
+float f8_e4m3_to_fp32(uint8_t x)
+{
+    const uint bits = uint(x);
+    const uint sign = bits >> 7;
+    const uint exponent = (bits >> 3) & 0x0Fu;
+    const uint mantissa = bits & 0x07u;
+
+    if (exponent == 0x0Fu && mantissa == 0x07u) {
+        return uintBitsToFloat((sign << 31) | 0x7FC00000u);
+    }
+
+    float value;
+    if (exponent == 0u) {
+        value = float(mantissa) * (1.0 / 512.0);
+    } else {
+        value = (1.0 + float(mantissa) / 8.0) * exp2(float(int(exponent) - 7));
+    }
+    return sign != 0u ? -value : value;
+}
+
+float f8_e5m2_to_fp32(uint8_t x)
+{
+    const uint bits = uint(x);
+    const uint sign = bits >> 7;
+    const uint exponent = (bits >> 2) & 0x1Fu;
+    const uint mantissa = bits & 0x03u;
+
+    if (exponent == 0x1Fu) {
+        const uint fp32_bits = mantissa == 0u ? 0x7F800000u : 0x7FC00000u;
+        return uintBitsToFloat((sign << 31) | fp32_bits);
+    }
+
+    float value;
+    if (exponent == 0u) {
+        value = float(mantissa) * (1.0 / 65536.0);
+    } else {
+        value = (1.0 + float(mantissa) / 4.0) * exp2(float(int(exponent) - 15));
+    }
+    return sign != 0u ? -value : value;
+}
+
 vec4 bf16_to_fp32(uvec4 u)
 {
     return vec4(bf16_to_fp32(u.x), bf16_to_fp32(u.y), bf16_to_fp32(u.z), bf16_to_fp32(u.w));

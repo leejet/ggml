@@ -7904,6 +7904,66 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef DV
 }
 
+template<typename T1, typename T0>
+static inline T1 cpy_cast(T0 value) {
+    return (T1) value;
+}
+
+struct ggml_fp8_e4m3_metal {
+    uint8_t value;
+};
+
+struct ggml_fp8_e5m2_metal {
+    uint8_t value;
+};
+
+static inline float fp8_e4m3_to_fp32(uint8_t x) {
+    const uint32_t sign     = x >> 7;
+    const uint32_t exponent = (x >> 3) & 0x0f;
+    const uint32_t mantissa = x & 0x07;
+
+    if (exponent == 0x0f && mantissa == 0x07) {
+        return as_type<float>((sign << 31) | 0x7fc00000);
+    }
+
+    float value;
+    if (exponent == 0) {
+        value = float(mantissa) * (1.0f / 512.0f);
+    } else {
+        value = (1.0f + float(mantissa) / 8.0f) * exp2(float(int(exponent) - 7));
+    }
+    return sign ? -value : value;
+}
+
+static inline float fp8_e5m2_to_fp32(uint8_t x) {
+    const uint32_t sign     = x >> 7;
+    const uint32_t exponent = (x >> 2) & 0x1f;
+    const uint32_t mantissa = x & 0x03;
+
+    if (exponent == 0x1f) {
+        const uint32_t fp32_bits = mantissa == 0 ? 0x7f800000 : 0x7fc00000;
+        return as_type<float>((sign << 31) | fp32_bits);
+    }
+
+    float value;
+    if (exponent == 0) {
+        value = float(mantissa) * (1.0f / 65536.0f);
+    } else {
+        value = (1.0f + float(mantissa) / 4.0f) * exp2(float(int(exponent) - 15));
+    }
+    return sign ? -value : value;
+}
+
+template<typename T1>
+static inline T1 cpy_cast(ggml_fp8_e4m3_metal value) {
+    return (T1) fp8_e4m3_to_fp32(value.value);
+}
+
+template<typename T1>
+static inline T1 cpy_cast(ggml_fp8_e5m2_metal value) {
+    return (T1) fp8_e5m2_to_fp32(value.value);
+}
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,
@@ -7932,7 +7992,7 @@ kernel void kernel_cpy_t_t(
 
     for (int32_t i00 = iw0*ntg[0] + tpitg.x; i00 < args.ne00;) {
         device const T0 * src = (device T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
-        dst_data[i00] = (T1) src[0];
+        dst_data[i00] = cpy_cast<T1>(src[0]);
         break;
     }
 }
@@ -7949,7 +8009,11 @@ template [[host_name("kernel_cpy_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_t_
 #endif
 template [[host_name("kernel_cpy_f16_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<half,    float>;
 template [[host_name("kernel_cpy_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<half,    half>;
+template [[host_name("kernel_cpy_f8_e4m3_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<ggml_fp8_e4m3_metal, half>;
+template [[host_name("kernel_cpy_f8_e5m2_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<ggml_fp8_e5m2_metal, half>;
 #if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_cpy_f8_e4m3_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<ggml_fp8_e4m3_metal, bfloat>;
+template [[host_name("kernel_cpy_f8_e5m2_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<ggml_fp8_e5m2_metal, bfloat>;
 template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  float>;
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
