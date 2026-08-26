@@ -171,6 +171,14 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 if (NOT GGML_BACKEND_DL)
     #
+    # test-fp8-cast
+
+    set(TEST_TARGET test-fp8-cast)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+    #
     # test-int8-convrot
 
     set(TEST_TARGET test-int8-convrot)
