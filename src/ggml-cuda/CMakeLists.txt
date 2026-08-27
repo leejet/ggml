@@ -139,6 +139,10 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()
 
+    if (GGML_CUDA_FORCE_I8_MMQ)
+        add_compile_definitions(GGML_CUDA_FORCE_I8_MMQ)
+    endif()
+
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
     endif()
