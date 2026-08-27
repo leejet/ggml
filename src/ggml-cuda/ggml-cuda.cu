@@ -1719,11 +1719,14 @@ static bool ggml_cuda_op_quantize_i8_convrot(
 }
 
 // INT8 convrot mulmat needs an INT8 GEMM. BLAS provides it on NVIDIA with
-// INT8 tensor cores and on AMD with WMMA/MFMA; RDNA2 has neither (no INT8
-// kernels in hipBLAS/rocBLAS, no matrix instructions) and uses the DP4A
-// MMQ kernel in mmq-i8.cu instead.
+// INT8 tensor cores and on AMD with WMMA/MFMA. RDNA2 has no INT8 matrix
+// instructions, but hipblasGemmEx computes CUDA_R_8I x CUDA_R_8I ->
+// CUDA_R_32I correctly on gfx1030 with ROCm >= 7.14 (verified first-hand
+// on a V620) and is ~5.7x faster than the DP4A MMQ kernel at Z-Image
+// shapes. Build with GGML_CUDA_FORCE_I8_MMQ to force the kernel instead
+// (for stacks where the rocBLAS INT8 route is broken).
 static bool ggml_cuda_i8_blas_available(const int cc) {
-    return turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);
+    return turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc);
 }
 
 static void ggml_cuda_mul_mat_i8(
