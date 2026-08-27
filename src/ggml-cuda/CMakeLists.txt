@@ -129,6 +129,13 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUBLASLT_FP8)
+        if (NOT GGML_STATIC OR WIN32)
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cublasLt)
+        endif()
+    endif()
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)

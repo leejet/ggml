@@ -715,6 +715,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+        if (cublaslt_handles[i] != nullptr) {
+            CUBLAS_CHECK(cublasLtDestroy(cublaslt_handles[i]));
+        }
+#endif
     }
 }
 
@@ -1775,6 +1780,192 @@ static __global__ void k_compute_batched_ptrs(
     ptrs_dst[0*ne23 + i12 + i13*ne12] = (      char *)         dst + i12*nbd2 + i13*nbd3;
 }
 
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+static __global__ void fp8_activation_amax_cuda(
+        const char * src,
+        float * amax,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        size_t nb0,
+        size_t nb1,
+        size_t nb2,
+        size_t nb3) {
+    const int64_t batch = blockIdx.y;
+    const int64_t i2    = batch % ne2;
+    const int64_t i3    = batch / ne2;
+    const int64_t n     = ne0 * ne1;
+
+    float value = 0.0f;
+    for (int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < n;
+         index += (int64_t)blockDim.x * gridDim.x) {
+        const int64_t i0 = index % ne0;
+        const int64_t i1 = index / ne0;
+        const float x = *(const float *)(src + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        value = fmaxf(value, fabsf(x));
+    }
+
+    __shared__ float maxima[256];
+    maxima[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicMax((unsigned int *)(amax + batch * 4), __float_as_uint(maxima[0]));
+    }
+}
+
+static __global__ void quantize_fp8_activation_e4m3_cuda(
+        const char * src,
+        uint8_t * dst,
+        const float * amax,
+        float * scale,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        size_t nb0,
+        size_t nb1,
+        size_t nb2,
+        size_t nb3) {
+    const int64_t batch = blockIdx.y;
+    const int64_t i2    = batch % ne2;
+    const int64_t i3    = batch / ne2;
+    const int64_t n     = ne0 * ne1;
+    const float maximum = amax[batch * 4];
+    const float quant_scale = maximum > 0.0f ? maximum / 448.0f : 1.0f;
+    const float inverse_scale = maximum > 0.0f ? 448.0f / maximum : 1.0f;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        scale[batch * 4] = quant_scale;
+    }
+    for (int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < n;
+         index += (int64_t)blockDim.x * gridDim.x) {
+        const int64_t i0 = index % ne0;
+        const int64_t i1 = index / ne0;
+        const float x = *(const float *)(src + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        const __nv_fp8_e4m3 fp8(x * inverse_scale);
+        dst[batch * n + index] = fp8.__x;
+    }
+}
+
+static bool ggml_cuda_should_use_fp8_matmul(
+        const ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+#if CUDART_VERSION < 12010
+    if (cc == GGML_CUDA_CC_ADA_LOVELACE) {
+        return false;
+    }
+#endif
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE ||
+        (src0->type != GGML_TYPE_F8_E4M3 && src0->type != GGML_TYPE_F8_E5M2) ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        dst->op_params[0] == GGML_PREC_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] * src1->ne[3] > 65535 ||
+        src0->ne[0] % 16 != 0 || src0->ne[1] % 16 != 0 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) ||
+        (uintptr_t)src0->data % 16 != 0 || (uintptr_t)dst->data % 16 != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_fp8(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne00 == ne10);
+    GGML_ASSERT(ne0 == ne01 && ne1 == ne11 && ne2 == ne12 && ne3 == ne13);
+
+    const int64_t batch_count    = ne12 * ne13;
+    const int64_t matrix_size    = ne10 * ne11;
+    const int64_t blocks         = std::min<int64_t>((matrix_size + 255) / 256, 1024);
+    cudaStream_t stream          = ctx.stream();
+
+    ggml_cuda_pool_alloc<uint8_t> activation_fp8(ctx.pool(), matrix_size * batch_count);
+    ggml_cuda_pool_alloc<float> scale_storage(ctx.pool(), batch_count * 8);
+    float * activation_amax  = scale_storage.get();
+    float * activation_scale = scale_storage.get() + batch_count * 4;
+
+    CUDA_CHECK(cudaMemsetAsync(
+        scale_storage.get(), 0, batch_count * 8 * sizeof(float), stream));
+    const dim3 grid((unsigned int)blocks, (unsigned int)batch_count, 1);
+    fp8_activation_amax_cuda<<<grid, 256, 0, stream>>>(
+        (const char *)src1->data, activation_amax,
+        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+    quantize_fp8_activation_e4m3_cuda<<<grid, 256, 0, stream>>>(
+        (const char *)src1->data, activation_fp8.get(), activation_amax, activation_scale,
+        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+    CUDA_CHECK(cudaGetLastError());
+
+    cublasLtMatmulDesc_t operation_desc;
+    cublasLtMatrixLayout_t a_desc;
+    cublasLtMatrixLayout_t b_desc;
+    cublasLtMatrixLayout_t c_desc;
+    cublasLtMatrixLayout_t d_desc;
+    const cudaDataType_t a_type = src0->type == GGML_TYPE_F8_E4M3
+        ? CUDA_R_8F_E4M3
+        : CUDA_R_8F_E5M2;
+    const cublasOperation_t trans_a = CUBLAS_OP_T;
+
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&operation_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+        operation_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, a_type, ne00, ne01, ne00));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8F_E4M3, ne10, ne11, ne10));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, ne0, ne1, ne0));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, ne0, ne1, ne0));
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    bool success = true;
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const void * b_scale = activation_scale + batch * 4;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            operation_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale, sizeof(b_scale)));
+
+        const uint8_t * b_ptr = activation_fp8.get() + batch * matrix_size;
+        float * d_ptr = (float *)dst->data + batch * ne0 * ne1;
+        const cublasStatus_t status = cublasLtMatmul(
+            ctx.cublaslt_handle(), operation_desc,
+            &alpha,
+            src0->data, a_desc,
+            b_ptr, b_desc,
+            &beta,
+            d_ptr, c_desc,
+            d_ptr, d_desc,
+            nullptr, nullptr, 0, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            if (status != CUBLAS_STATUS_NOT_SUPPORTED) {
+                CUBLAS_CHECK(status);
+            }
+            success = false;
+            break;
+        }
+    }
+
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(d_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
+    CUBLAS_CHECK(cublasLtMatmulDescDestroy(operation_desc));
+    return success;
+}
+#endif
+
 // Type traits for mapping ggml types to CUDA/cuBLAS types
 template<ggml_type T>
 struct batched_mul_mat_traits;
@@ -2036,10 +2227,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     ggml_type compute_type = src0->type;
-    if (ggml_is_quantized(compute_type)) {
-        compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
-    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
+    if (compute_type == GGML_TYPE_F8_E4M3 || compute_type == GGML_TYPE_F8_E5M2) {
+        compute_type = bf16_mma_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+    } else if (ggml_is_quantized(compute_type)) {
+        compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
     }
     if (dst->op_params[0] == GGML_PREC_F32) {
@@ -2244,6 +2438,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
         return;
     }
+
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+    if (ggml_cuda_should_use_fp8_matmul(ctx, src0, src1, dst) &&
+        ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -5265,7 +5466,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
 #endif
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
+                    a->type != GGML_TYPE_F8_E4M3 && a->type != GGML_TYPE_F8_E5M2) {
                     return false;
                 }
 #ifdef GGML_USE_MUSA
@@ -5309,6 +5511,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_F8_E4M3:
+                    case GGML_TYPE_F8_E5M2:
                         return true;
                     default:
                         return false;

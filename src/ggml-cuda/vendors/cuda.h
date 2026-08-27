@@ -3,6 +3,9 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <cublas_v2.h>
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+#include <cublasLt.h>
+#endif
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
