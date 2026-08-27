@@ -2353,7 +2353,9 @@ struct ggml_backend_vk_context {
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
+    size_t prealloc_size_qconvrot;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    vk_buffer prealloc_qconvrot;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -2377,7 +2379,7 @@ struct ggml_backend_vk_context {
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
-    bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync;
+    bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync, prealloc_qconvrot_need_sync;
 
     vk_context_ref compute_ctx;
 
@@ -3648,7 +3650,7 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     const bool transfer_queue = subctx->p->q->transfer_only;
 
     if (ctx) {
-        ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+        ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = ctx->prealloc_qconvrot_need_sync = false;
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
@@ -7612,6 +7614,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_qconvrot = 0;
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -10014,27 +10017,39 @@ static bool ggml_vk_can_use_mul_mat_i8_tensorwise(const vk_device & device, cons
     const ggml_tensor * input = dst->src[1];
     const ggml_tensor * weight_scale = dst->src[2];
     const ggml_tensor * bias = dst->src[3];
-    const ggml_tensor * logical_input = input != nullptr ? input->src[0] : nullptr;
     if (!device->integer_dot_product || weight == nullptr || input == nullptr ||
-        weight->type != GGML_TYPE_I8 || input->type != GGML_TYPE_I8 ||
-        input->op != GGML_OP_QUANTIZE_I8_CONVROT || logical_input == nullptr ||
-        logical_input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-        weight_scale == nullptr ||
+        weight->type != GGML_TYPE_I8 || dst->type != GGML_TYPE_F32 ||
         weight->ne[2] != 1 || weight->ne[3] != 1 ||
+        weight_scale == nullptr ||
         !ggml_is_contiguous(weight) || !ggml_is_contiguous(input) ||
-        !ggml_is_contiguous(logical_input) || !ggml_is_contiguous(weight_scale) ||
-        !ggml_is_contiguous(dst)) {
+        !ggml_is_contiguous(weight_scale) || !ggml_is_contiguous(dst)) {
         return false;
     }
 
+    // The input is either quantized on the fly from F32, or prequantized
+    // with ggml_quantize_i8_convrot into the packed payload+scales layout.
+    int64_t rows;
+    if (input->type == GGML_TYPE_F32) {
+        rows = ggml_nrows(input);
+    } else {
+        const ggml_tensor * logical_input = input->src[0];
+        if (input->type != GGML_TYPE_I8 || input->op != GGML_OP_QUANTIZE_I8_CONVROT ||
+            logical_input == nullptr || logical_input->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(logical_input)) {
+            return false;
+        }
+        rows = ggml_nrows(logical_input);
+    }
+
     const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
-    const int64_t rows = ggml_nrows(logical_input);
     const int64_t rows_padded = GGML_PAD(rows, 4);
     const int64_t scale_rows = (rows * (int64_t) sizeof(float) + weight->ne[0] - 1) / weight->ne[0];
     return (convrot_group_size == 64 || convrot_group_size == 256) &&
-           ggml_get_op_params_i32(input, 0) == convrot_group_size &&
+           input->ne[0] == weight->ne[0] &&
            weight->ne[0] % convrot_group_size == 0 &&
-           input->ne[0] == weight->ne[0] && input->ne[1] == rows_padded + scale_rows &&
+           (input->type == GGML_TYPE_F32 ||
+            (ggml_get_op_params_i32(input, 0) == convrot_group_size &&
+             input->ne[1] == rows_padded + scale_rows)) &&
            ggml_nrows(dst) == rows && weight_scale->type == GGML_TYPE_F32 &&
            ggml_nelements(weight_scale) == weight->ne[1] &&
            (bias == nullptr ||
@@ -10042,7 +10057,10 @@ static bool ggml_vk_can_use_mul_mat_i8_tensorwise(const vk_device & device, cons
              ggml_nelements(bias) == weight->ne[1])) &&
            weight->ne[0] / 4 <= std::numeric_limits<uint32_t>::max() &&
            weight->ne[1] <= std::numeric_limits<uint32_t>::max() &&
-           rows <= std::numeric_limits<uint32_t>::max();
+           rows <= std::numeric_limits<uint32_t>::max() &&
+           (input->type != GGML_TYPE_F32 ||
+            (uint64_t) weight->ne[0] * rows_padded + (uint64_t) rows * sizeof(float) <=
+                device->properties.limits.maxStorageBufferRange);
 #else
     GGML_UNUSED(device);
     GGML_UNUSED(dst);
@@ -10050,34 +10068,37 @@ static bool ggml_vk_can_use_mul_mat_i8_tensorwise(const vk_device & device, cons
 #endif
 }
 
+static void ggml_vk_quantize_i8_convrot_subbuf(
+        ggml_backend_vk_context * ctx, vk_context & subctx,
+        const vk_subbuffer & src_buf, const vk_subbuffer & quantized_buf,
+        const vk_subbuffer & scales_buf, uint32_t k, uint32_t rows, int group_size) {
+    vk_pipeline pipeline = group_size == 64
+        ? ctx->device->pipeline_quantize_i8_convrot_h64
+        : ctx->device->pipeline_quantize_i8_convrot;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_quantize_i8_convrot_push_constants pc = { k, rows };
+    const uint32_t workgroups = std::min(rows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, pipeline, { src_buf, quantized_buf, scales_buf }, pc, { workgroups, 1, 1 });
+}
+
 static void ggml_vk_quantize_i8_convrot(
         ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * src, ggml_tensor * dst) {
     GGML_ASSERT(ggml_vk_can_use_quantize_i8_convrot(ctx->device, dst));
     const int group_size = ggml_get_op_params_i32(dst, 0);
-    vk_pipeline pipeline = group_size == 64
-        ? ctx->device->pipeline_quantize_i8_convrot_h64
-        : ctx->device->pipeline_quantize_i8_convrot;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t rows = (uint32_t) ggml_nrows(src);
     const uint64_t rows_padded = GGML_PAD((uint64_t) rows, 4);
     const uint64_t scale_offset = (uint64_t) src->ne[0] * rows_padded;
     const vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src);
     const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    const vk_subbuffer quantized_buf = { dst_buf.buffer, dst_buf.offset, scale_offset };
-    const vk_subbuffer scales_buf = {
-        dst_buf.buffer,
-        dst_buf.offset + scale_offset,
-        (uint64_t) rows * sizeof(float),
-    };
-    const vk_quantize_i8_convrot_push_constants pc = {
-        (uint32_t) src->ne[0],
-        rows,
-    };
-    const uint32_t workgroups = std::min(rows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
-    ggml_vk_dispatch_pipeline(
-        ctx, subctx, pipeline, { src_buf, quantized_buf, scales_buf }, pc, { workgroups, 1, 1 });
+    ggml_vk_quantize_i8_convrot_subbuf(
+        ctx, subctx, src_buf,
+        { dst_buf.buffer, dst_buf.offset, scale_offset },
+        { dst_buf.buffer, dst_buf.offset + scale_offset, (uint64_t) rows * sizeof(float) },
+        (uint32_t) src->ne[0], rows, group_size);
 }
 
 static void ggml_vk_mul_mat_i8_tensorwise(
@@ -10100,13 +10121,38 @@ static void ggml_vk_mul_mat_i8_tensorwise(
     const uint64_t rows_padded = GGML_PAD((uint64_t) rows, 4);
     const uint64_t scale_offset = (uint64_t) weight->ne[0] * rows_padded;
     const vk_subbuffer weight_buf = ggml_vk_tensor_subbuffer(ctx, weight);
-    const vk_subbuffer input_buf = ggml_vk_tensor_subbuffer(ctx, input);
-    const vk_subbuffer quantized_buf = { input_buf.buffer, input_buf.offset, scale_offset };
-    const vk_subbuffer activation_scales_buf = {
-        input_buf.buffer,
-        input_buf.offset + scale_offset,
-        (uint64_t) rows * sizeof(float),
-    };
+    vk_subbuffer quantized_buf;
+    vk_subbuffer activation_scales_buf;
+    if (input->type == GGML_TYPE_F32) {
+        // Quantize the F32 input on the fly into the preallocated packed layout.
+        const uint64_t qconvrot_size = scale_offset + (uint64_t) rows * sizeof(float);
+        if (ctx->prealloc_size_qconvrot < qconvrot_size) {
+            ctx->prealloc_size_qconvrot = qconvrot_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_qconvrot_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        quantized_buf = { ctx->prealloc_qconvrot, 0, scale_offset };
+        activation_scales_buf = {
+            ctx->prealloc_qconvrot,
+            scale_offset,
+            (uint64_t) rows * sizeof(float),
+        };
+        ggml_vk_quantize_i8_convrot_subbuf(
+            ctx, subctx, ggml_vk_tensor_subbuffer(ctx, input),
+            quantized_buf, activation_scales_buf,
+            (uint32_t) input->ne[0], rows, ggml_get_op_params_i32(dst, 2));
+        ggml_vk_sync_buffers(ctx, subctx);
+    } else {
+        const vk_subbuffer input_buf = ggml_vk_tensor_subbuffer(ctx, input);
+        quantized_buf = { input_buf.buffer, input_buf.offset, scale_offset };
+        activation_scales_buf = {
+            input_buf.buffer,
+            input_buf.offset + scale_offset,
+            (uint64_t) rows * sizeof(float),
+        };
+    }
     const vk_subbuffer weight_scales_buf = ggml_vk_tensor_subbuffer(ctx, weight_scale);
     const vk_subbuffer bias_buf = bias != nullptr
         ? ggml_vk_tensor_subbuffer(ctx, bias)
@@ -10134,6 +10180,9 @@ static void ggml_vk_mul_mat_i8_tensorwise(
         dispatch(ctx->device->pipeline_mul_mat_i8_tensorwise_cm1, 0, coop_rows);
     }
     dispatch(ctx->device->pipeline_mul_mat_i8_tensorwise, coop_rows, rows - coop_rows);
+    if (input->type == GGML_TYPE_F32) {
+        ctx->prealloc_qconvrot_need_sync = true;
+    }
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -15316,6 +15365,14 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
     }
+    if (ctx->prealloc_qconvrot == nullptr || (ctx->prealloc_size_qconvrot > 0 && ctx->prealloc_qconvrot->size < ctx->prealloc_size_qconvrot)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(qconvrot_size: " << ctx->prealloc_size_qconvrot << ")");
+        // Resize buffer
+        if (ctx->prealloc_qconvrot != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_qconvrot);
+        }
+        ctx->prealloc_qconvrot = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_qconvrot);
+    }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
         // Resize buffer
@@ -15969,6 +16026,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->prealloc_qconvrot);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
 
@@ -15979,6 +16037,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_qconvrot = 0;
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
