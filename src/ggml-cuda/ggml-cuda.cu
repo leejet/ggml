@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmq-i8.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1717,6 +1718,14 @@ static bool ggml_cuda_op_quantize_i8_convrot(
     return true;
 }
 
+// INT8 convrot mulmat needs an INT8 GEMM. BLAS provides it on NVIDIA with
+// INT8 tensor cores and on AMD with WMMA/MFMA; RDNA2 has neither (no INT8
+// kernels in hipBLAS/rocBLAS, no matrix instructions) and uses the DP4A
+// MMQ kernel in mmq-i8.cu instead.
+static bool ggml_cuda_i8_blas_available(const int cc) {
+    return turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);
+}
+
 static void ggml_cuda_mul_mat_i8(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -1768,15 +1777,26 @@ static void ggml_cuda_mul_mat_i8(
     const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
     ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
 
-    const int32_t alpha = 1;
-    const int32_t beta  = 0;
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-    CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-        (int)n, (int)rows_padded, (int)k,
-        &alpha, src0->data, CUDA_R_8I, (int)k,
-                qdata_d, CUDA_R_8I, (int)qstride,
-        &beta,  accum.get(), CUDA_R_32I, (int)n,
-        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+#if defined(GGML_CUDA_FORCE_I8_MMQ)
+    const bool use_blas = false;
+#else
+    const bool use_blas = ggml_cuda_i8_blas_available(ggml_cuda_info().devices[ctx.device].cc);
+#endif
+
+    if (use_blas) {
+        const int32_t alpha = 1;
+        const int32_t beta  = 0;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)n, (int)rows_padded, (int)k,
+            &alpha, src0->data, CUDA_R_8I, (int)k,
+                    qdata_d, CUDA_R_8I, (int)qstride,
+            &beta,  accum.get(), CUDA_R_32I, (int)n,
+            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else {
+        ggml_cuda_mul_mat_i8_mmq(
+            ctx, (const int8_t *)src0->data, qdata_d, accum.get(), n, rows, k, stream);
+    }
 
     const dim3 dequant_grid((n + 255) / 256, rows, 1);
     dequantize_i32_rows_cuda<<<dequant_grid, 256, 0, stream>>>(
@@ -5296,9 +5316,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (convrot_group_size == 0 ||
                             ((convrot_group_size == 64 || convrot_group_size == 256) &&
                              a->ne[0] % convrot_group_size == 0)) &&
-                           (turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
-                            amd_wmma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
-                            amd_mfma_available(ggml_cuda_info().devices[dev_ctx->device].cc));
+                           ggml_cuda_i8_blas_available(ggml_cuda_info().devices[dev_ctx->device].cc);
 #else
                     return false;
 #endif
@@ -5811,6 +5829,10 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
     #ifdef GGML_CUDA_FORCE_MMQ
         features.push_back({ "FORCE_MMQ", "1" });
+    #endif
+
+    #ifdef GGML_CUDA_FORCE_I8_MMQ
+        features.push_back({ "FORCE_I8_MMQ", "1" });
     #endif
 
     #ifdef GGML_CUDA_FORCE_CUBLAS
