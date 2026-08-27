@@ -878,6 +878,7 @@ void process_shaders() {
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("quantize_i8_convrot", "quantize_i8_convrot.comp", {});
+    string_to_spv("quantize_i8_convrot_h64", "quantize_i8_convrot.comp", {{"GROUP_SIZE", "64"}});
     string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise.comp", {});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm1.comp", {}, true, true);
