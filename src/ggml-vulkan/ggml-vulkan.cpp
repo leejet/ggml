@@ -912,6 +912,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_i8_convrot;
+    vk_pipeline pipeline_quantize_i8_convrot_h64;
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
 
@@ -5474,6 +5475,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     if (device->integer_dot_product) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot, "quantize_i8_convrot", quantize_i8_convrot_len, quantize_i8_convrot_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot_h64, "quantize_i8_convrot_h64", quantize_i8_convrot_h64_len, quantize_i8_convrot_h64_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise, "mul_mat_i8_tensorwise", mul_mat_i8_tensorwise_len, mul_mat_i8_tensorwise_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {16, 16, 1}, {}, 1);
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (device->coopmat_int_support) {
@@ -9995,7 +9997,7 @@ static bool ggml_vk_can_use_quantize_i8_convrot(const vk_device & device, const 
     const int64_t rows = ggml_nrows(src);
     const int64_t rows_padded = GGML_PAD(rows, 4);
     const int64_t scale_rows = (rows * (int64_t) sizeof(float) + src->ne[0] - 1) / src->ne[0];
-    return group_size == 256 && src->ne[0] % 256 == 0 &&
+    return (group_size == 64 || group_size == 256) && src->ne[0] % group_size == 0 &&
            src->ne[0] <= std::numeric_limits<uint32_t>::max() &&
            rows <= std::numeric_limits<uint32_t>::max() &&
            dst->ne[0] == src->ne[0] && dst->ne[1] == rows_padded + scale_rows;
@@ -10029,8 +10031,9 @@ static bool ggml_vk_can_use_mul_mat_i8_tensorwise(const vk_device & device, cons
     const int64_t rows = ggml_nrows(logical_input);
     const int64_t rows_padded = GGML_PAD(rows, 4);
     const int64_t scale_rows = (rows * (int64_t) sizeof(float) + weight->ne[0] - 1) / weight->ne[0];
-    return convrot_group_size == 256 && ggml_get_op_params_i32(input, 0) == 256 &&
-           weight->ne[0] % 256 == 0 &&
+    return (convrot_group_size == 64 || convrot_group_size == 256) &&
+           ggml_get_op_params_i32(input, 0) == convrot_group_size &&
+           weight->ne[0] % convrot_group_size == 0 &&
            input->ne[0] == weight->ne[0] && input->ne[1] == rows_padded + scale_rows &&
            ggml_nrows(dst) == rows && weight_scale->type == GGML_TYPE_F32 &&
            ggml_nelements(weight_scale) == weight->ne[1] &&
@@ -10051,7 +10054,10 @@ static void ggml_vk_quantize_i8_convrot(
         ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * src, ggml_tensor * dst) {
     GGML_ASSERT(ggml_vk_can_use_quantize_i8_convrot(ctx->device, dst));
-    vk_pipeline pipeline = ctx->device->pipeline_quantize_i8_convrot;
+    const int group_size = ggml_get_op_params_i32(dst, 0);
+    vk_pipeline pipeline = group_size == 64
+        ? ctx->device->pipeline_quantize_i8_convrot_h64
+        : ctx->device->pipeline_quantize_i8_convrot;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t rows = (uint32_t) ggml_nrows(src);
