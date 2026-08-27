@@ -66,11 +66,23 @@ int main(int argc, char ** argv) {
     ggml_tensor * q_large  = ggml_quantize_i8_convrot(ctx, x_large, 256);
     ggml_tensor * fused_large = ggml_mul_mat_i8_tensorwise(ctx, w_large, q_large, ws_large, b_large, 256);
     ggml_tensor * fused_large_no_bias = ggml_mul_mat_i8_tensorwise(ctx, w_large, q_large, ws_large, nullptr, 256);
+    ggml_tensor * q_large_g64 = ggml_quantize_i8_convrot(ctx, x_large, 64);
+    ggml_tensor * fused_g64_packed = ggml_mul_mat_i8_tensorwise(ctx, w_large, q_large_g64, ws_large, b_large, 64);
+    // F32-input form: the input is quantized on the fly inside the op.
+    ggml_tensor * fused256_f32 = ggml_mul_mat_i8_tensorwise(ctx, w256, x256, ws256, b256, 256);
+    ggml_tensor * fused_f32_large = ggml_mul_mat_i8_tensorwise(ctx, w_large, x_large, ws_large, b_large, 256);
+    ggml_tensor * fused_f32_large_no_bias = ggml_mul_mat_i8_tensorwise(ctx, w_large, x_large, ws_large, nullptr, 256);
+    ggml_tensor * fused_f32_g64 = ggml_mul_mat_i8_tensorwise(ctx, w_large, x_large, ws_large, b_large, 64);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, fused256);
     ggml_build_forward_expand(graph, fused_large);
     ggml_build_forward_expand(graph, fused_large_no_bias);
+    ggml_build_forward_expand(graph, fused_g64_packed);
+    ggml_build_forward_expand(graph, fused256_f32);
+    ggml_build_forward_expand(graph, fused_f32_large);
+    ggml_build_forward_expand(graph, fused_f32_large_no_bias);
+    ggml_build_forward_expand(graph, fused_f32_g64);
 
     ggml_backend_t backend = nullptr;
     if (use_cuda || use_vulkan) {
@@ -93,9 +105,14 @@ int main(int argc, char ** argv) {
         ggml_backend_cpu_set_n_threads(backend, 2);
     }
     if (!ggml_backend_supports_op(backend, q_large) ||
+        !ggml_backend_supports_op(backend, q_large_g64) ||
         !ggml_backend_supports_op(backend, fused_large) ||
-        !ggml_backend_supports_op(backend, fused_large_no_bias)) {
-        std::fprintf(stderr, "backend does not report packed INT8 convrot matmul support\n");
+        !ggml_backend_supports_op(backend, fused_large_no_bias) ||
+        !ggml_backend_supports_op(backend, fused_g64_packed) ||
+        !ggml_backend_supports_op(backend, fused_f32_large) ||
+        !ggml_backend_supports_op(backend, fused_f32_large_no_bias) ||
+        !ggml_backend_supports_op(backend, fused_f32_g64)) {
+        std::fprintf(stderr, "backend does not report INT8 convrot matmul support\n");
         return 1;
     }
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -167,20 +184,47 @@ int main(int argc, char ** argv) {
     }
     std::vector<float> fused_data(4);
     ggml_backend_tensor_get(fused256, fused_data.data(), 0, ggml_nbytes(fused256));
-    for (size_t i = 0; i < expected_fused.size(); ++i) {
-        if (!nearly_equal(fused_data[i], expected_fused[i])) {
-            std::fprintf(stderr, "fused INT8 convrot mismatch at %zu: %.8f != %.8f\n", i, fused_data[i], expected_fused[i]);
-            return 1;
+    // The F32-input form must match the packed form: same quantizer, same GEMM.
+    {
+        std::vector<float> fused256_f32_data(4);
+        ggml_backend_tensor_get(fused256_f32, fused256_f32_data.data(), 0, ggml_nbytes(fused256_f32));
+        for (size_t i = 0; i < fused_data.size(); ++i) {
+            if (!nearly_equal(fused256_f32_data[i], fused_data[i])) {
+                std::fprintf(stderr, "F32-input vs packed mismatch at %zu: %.8f != %.8f\n", i, fused256_f32_data[i], fused_data[i]);
+                return 1;
+            }
+        }
+    }
+    if (!use_cuda && !use_vulkan) {
+        // On CPU the F32-input path quantizes exactly like the reference above,
+        // so the packed-form expected values apply unchanged.
+        for (size_t i = 0; i < expected_fused.size(); ++i) {
+            if (!nearly_equal(fused_data[i], expected_fused[i])) {
+                std::fprintf(stderr, "fused INT8 convrot mismatch at %zu: %.8f != %.8f\n", i, fused_data[i], expected_fused[i]);
+                return 1;
+            }
         }
     }
 
     std::vector<int8_t> q_large_data(ggml_nbytes(q_large));
     std::vector<float> fused_large_data(ggml_nelements(fused_large));
     std::vector<float> fused_large_no_bias_data(ggml_nelements(fused_large_no_bias));
+    std::vector<float> fused_g64_packed_data(ggml_nelements(fused_g64_packed));
+    std::vector<float> fused_f32_large_data(ggml_nelements(fused_f32_large));
+    std::vector<float> fused_f32_large_no_bias_data(ggml_nelements(fused_f32_large_no_bias));
+    std::vector<float> fused_f32_g64_data(ggml_nelements(fused_f32_g64));
     ggml_backend_tensor_get(q_large, q_large_data.data(), 0, ggml_nbytes(q_large));
     ggml_backend_tensor_get(fused_large, fused_large_data.data(), 0, ggml_nbytes(fused_large));
     ggml_backend_tensor_get(
         fused_large_no_bias, fused_large_no_bias_data.data(), 0, ggml_nbytes(fused_large_no_bias));
+    ggml_backend_tensor_get(
+        fused_g64_packed, fused_g64_packed_data.data(), 0, ggml_nbytes(fused_g64_packed));
+    ggml_backend_tensor_get(
+        fused_f32_large, fused_f32_large_data.data(), 0, ggml_nbytes(fused_f32_large));
+    ggml_backend_tensor_get(
+        fused_f32_large_no_bias, fused_f32_large_no_bias_data.data(), 0, ggml_nbytes(fused_f32_large_no_bias));
+    ggml_backend_tensor_get(
+        fused_f32_g64, fused_f32_g64_data.data(), 0, ggml_nbytes(fused_f32_g64));
     const int large_rows_padded = (large_rows + 3) & ~3;
     std::vector<float> large_activation_scales(large_rows);
     std::memcpy(
@@ -213,6 +257,28 @@ int main(int argc, char ** argv) {
                     index, fused_large_no_bias_data[index], expected_no_bias);
                 return 1;
             }
+        }
+    }
+
+    // The F32-input form must match the packed form: same quantizer, same GEMM.
+    for (size_t i = 0; i < fused_large_data.size(); ++i) {
+        if (!nearly_equal(fused_f32_large_data[i], fused_large_data[i])) {
+            std::fprintf(
+                stderr, "F32-input vs packed mismatch at %zu: %.8f != %.8f\n",
+                i, fused_f32_large_data[i], fused_large_data[i]);
+            return 1;
+        }
+        if (!nearly_equal(fused_f32_large_no_bias_data[i], fused_large_no_bias_data[i])) {
+            std::fprintf(
+                stderr, "F32-input no-bias vs packed mismatch at %zu: %.8f != %.8f\n",
+                i, fused_f32_large_no_bias_data[i], fused_large_no_bias_data[i]);
+            return 1;
+        }
+        if (!nearly_equal(fused_f32_g64_data[i], fused_g64_packed_data[i])) {
+            std::fprintf(
+                stderr, "F32-input G64 vs packed G64 mismatch at %zu: %.8f != %.8f\n",
+                i, fused_f32_g64_data[i], fused_g64_packed_data[i]);
+            return 1;
         }
     }
 

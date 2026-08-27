@@ -20,6 +20,8 @@
 #define CUDA_R_16F  HIPBLAS_R_16F
 #define CUDA_R_16BF HIPBLAS_R_16B
 #define CUDA_R_32F  HIPBLAS_R_32F
+#define CUDA_R_8I   HIPBLAS_R_8I
+#define CUDA_R_32I  HIPBLAS_R_32I
 #define CUBLAS_SIDE_RIGHT HIPBLAS_SIDE_RIGHT
 #define CUBLAS_FILL_MODE_UPPER HIPBLAS_FILL_MODE_UPPER
 #define CUBLAS_DIAG_NON_UNIT HIPBLAS_DIAG_NON_UNIT
@@ -32,6 +34,8 @@
 #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
 #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
 #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+// Variadic: call sites may omit the trailing width argument.
+#define __shfl_down_sync(mask, ...) __shfl_down(__VA_ARGS__)
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
 #define cublasStrsmBatched hipblasStrsmBatched
@@ -159,6 +163,7 @@
 #if HIP_VERSION >= 60500000
 #define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
+#define CUBLAS_COMPUTE_32I HIPBLAS_COMPUTE_32I
 #define CUBLAS_COMPUTE_32F_FAST_16F HIPBLAS_COMPUTE_32F_FAST_16F
 #define cublasComputeType_t hipblasComputeType_t
 #define cudaDataType_t hipDataType
