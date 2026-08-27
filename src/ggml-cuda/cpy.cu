@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "fp8.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -10,54 +11,6 @@ typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
-
-struct ggml_fp8_e4m3_cuda {
-    uint8_t value;
-
-    __device__ operator float() const {
-        const uint32_t sign     = value >> 7;
-        const uint32_t exponent = (value >> 3) & 0x0f;
-        const uint32_t mantissa = value & 0x07;
-
-        if (exponent == 0x0f && mantissa == 0x07) {
-            return sign ? -nanf("") : nanf("");
-        }
-
-        float result;
-        if (exponent == 0) {
-            result = ldexpf((float) mantissa, -9);
-        } else {
-            result = ldexpf(1.0f + (float) mantissa / 8.0f, (int) exponent - 7);
-        }
-        return sign ? -result : result;
-    }
-};
-
-struct ggml_fp8_e5m2_cuda {
-    uint8_t value;
-
-    __device__ operator float() const {
-        const uint32_t sign     = value >> 7;
-        const uint32_t exponent = (value >> 2) & 0x1f;
-        const uint32_t mantissa = value & 0x03;
-
-        if (exponent == 0x1f) {
-            const float result = mantissa == 0 ? INFINITY : nanf("");
-            return sign ? -result : result;
-        }
-
-        float result;
-        if (exponent == 0) {
-            result = ldexpf((float) mantissa, -16);
-        } else {
-            result = ldexpf(1.0f + (float) mantissa / 4.0f, (int) exponent - 15);
-        }
-        return sign ? -result : result;
-    }
-};
-
-static_assert(sizeof(ggml_fp8_e4m3_cuda) == 1, "unexpected E4M3 storage size");
-static_assert(sizeof(ggml_fp8_e5m2_cuda) == 1, "unexpected E5M2 storage size");
 
 template <cpy_kernel_t cpy_1>
 static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne,
