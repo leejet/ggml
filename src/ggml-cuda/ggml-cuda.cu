@@ -2967,7 +2967,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
         case GGML_OP_QUANTIZE_I8_CONVROT:
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
             GGML_ASSERT(ggml_cuda_op_quantize_i8_convrot(ctx, dst->src[0], dst, ggml_get_op_params_i32(dst, 0)));
 #else
             GGML_ABORT("INT8 convrot quantization is only implemented for CUDA");
@@ -6008,7 +6008,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_QUANTIZE_I8_CONVROT:
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
             {
                 const ggml_tensor * src = op->src[0];
                 const int group_size    = ggml_get_op_params_i32(op, 0);
