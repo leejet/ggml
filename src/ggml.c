@@ -3336,7 +3336,8 @@ GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
 
     const struct ggml_tensor * logical_input = input;
     if (input->type == GGML_TYPE_I8) {
-        GGML_ASSERT(input->op == GGML_OP_QUANTIZE_I8_CONVROT);
+        // accept any packed-shape I8 input: the scheduler rewrites graph inputs
+        // into CPY copies, so the producing op is not a reliable marker
         GGML_ASSERT(input->src[0] != NULL);
         logical_input = input->src[0];
         const int64_t rows_padded = GGML_PAD(ggml_nrows(logical_input), 4);
@@ -3399,6 +3400,76 @@ struct ggml_tensor * ggml_quantize_i8_convrot(
     result->op                  = GGML_OP_QUANTIZE_I8_CONVROT;
     result->src[0]              = a;
     ggml_set_op_params_i32(result, 0, group_size);
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_w4_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * weight_scales,
+        struct ggml_tensor  * s_channel,
+        struct ggml_tensor  * s_rel,
+        struct ggml_tensor  * bias,
+        int                   kind,
+        int                   convrot_group_size) {
+    GGML_ASSERT(weight->type == GGML_TYPE_I8);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_I8);
+    GGML_ASSERT(kind == GGML_W4_CONVROT_KIND_W4A4 || kind == GGML_W4_CONVROT_KIND_W4A8);
+
+    const int64_t k = 2 * weight->ne[0];
+
+    const struct ggml_tensor * logical_input = input;
+    if (input->type == GGML_TYPE_I8) {
+        // accept any packed-shape I8 input: the scheduler rewrites graph inputs
+        // into CPY copies, so the producing op is not a reliable marker
+        GGML_ASSERT(input->src[0] != NULL);
+        logical_input = input->src[0];
+        const int64_t rows_padded = GGML_PAD(ggml_nrows(logical_input), 4);
+        const int64_t scale_rows  = (ggml_nrows(logical_input) * (int64_t)sizeof(float) + k - 1) / k;
+        GGML_ASSERT(input->ne[0] == k);
+        GGML_ASSERT(input->ne[1] == rows_padded + scale_rows);
+    }
+    GGML_ASSERT(logical_input->ne[0] == k);
+
+    if (kind == GGML_W4_CONVROT_KIND_W4A4) {
+        GGML_ASSERT(weight_scales != NULL && weight_scales->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(weight_scales));
+        GGML_ASSERT(ggml_nelements(weight_scales) == weight->ne[1]);
+        GGML_ASSERT(s_channel == NULL && s_rel == NULL);
+    } else {
+        GGML_ASSERT(k % 16 == 0);
+        GGML_ASSERT(weight_scales != NULL && weight_scales->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(weight_scales));
+        GGML_ASSERT(ggml_nelements(weight_scales) == 16);
+        GGML_ASSERT(s_channel != NULL && s_channel->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(s_channel));
+        GGML_ASSERT(ggml_nelements(s_channel) == weight->ne[1]);
+        GGML_ASSERT(s_rel != NULL && s_rel->type == GGML_TYPE_F8_E4M3);
+        GGML_ASSERT(ggml_is_contiguous(s_rel));
+        GGML_ASSERT(s_rel->ne[0] == k / 16 && s_rel->ne[1] == weight->ne[1]);
+    }
+    GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
+    GGML_ASSERT(bias == NULL || ggml_nelements(bias) == weight->ne[1]);
+    GGML_ASSERT(convrot_group_size == 0 || k % convrot_group_size == 0);
+
+    int n = convrot_group_size;
+    while (n > 1 && n % 4 == 0) {
+        n /= 4;
+    }
+    GGML_ASSERT(n == 0 || n == 1);
+
+    const int64_t ne[4] = { weight->ne[1], logical_input->ne[1], logical_input->ne[2], logical_input->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op                  = GGML_OP_MUL_MAT;
+    result->src[0]              = weight;
+    result->src[1]              = input;
+    result->src[2]              = weight_scales;
+    result->src[3]              = bias;
+    result->src[4]              = s_rel;
+    result->src[5]              = s_channel;
+    ggml_set_op_params_i32(result, 2, convrot_group_size);
+    ggml_set_op_params_i32(result, 3, kind);
     return result;
 }
 

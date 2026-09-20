@@ -1460,6 +1460,31 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   group_size);
 
+    // weight-kind selectors for ggml_mul_mat_w4_convrot, stored in op_params slot 3.
+    // Slot 3 is zero-initialized, so 0 keeps ggml_mul_mat_i8_tensorwise chains.
+    enum ggml_w4_convrot_kind {
+        GGML_W4_CONVROT_KIND_W4A4 = 1,  // signed int4 nibbles; weight_scales = F32 [N] row scales
+        GGML_W4_CONVROT_KIND_W4A8 = 2,  // codebook weights; weight_scales = F32 [16] codebook,
+                                        // s_channel = F32 [N], s_rel = F8_E4M3 [K/16, N]
+    };
+
+    // Packed-w4 convrot matrix multiplication: y = w * x, with w in a checkpoint
+    // custom 4-bit format decoded by the kernels. weight is byte-packed nibbles
+    // GGML_TYPE_I8 with ne = [K/2, N], low nibble = even k. input follows the
+    // same contract as ggml_mul_mat_i8_tensorwise (F32 or the packed output of
+    // ggml_quantize_i8_convrot). Applies convrot Hadamard rotation to F32
+    // activations for convrot_group_size > 0, same as the int8 path.
+    GGML_API struct ggml_tensor * ggml_mul_mat_w4_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * weight_scales,
+            struct ggml_tensor  * s_channel,
+            struct ggml_tensor  * s_rel,
+            struct ggml_tensor  * bias,
+            int                   kind,
+            int                   convrot_group_size);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,

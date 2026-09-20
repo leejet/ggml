@@ -2,7 +2,21 @@
 
 #extension GL_EXT_control_flow_attributes : require
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#ifndef GROUP_SIZE
+#define GROUP_SIZE 256
+#endif
+#if GROUP_SIZE != 64 && GROUP_SIZE != 256
+#error unsupported GROUP_SIZE
+#endif
+#define GROUP_THREADS (GROUP_SIZE / 4)
+
+#if GROUP_SIZE == 256
+#define HADAMARD_NORM (1.0 / 16.0)
+#else
+#define HADAMARD_NORM (1.0 / 8.0)
+#endif
+
+layout(local_size_x = GROUP_THREADS, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform parameter
 {
@@ -14,22 +28,22 @@ layout(binding = 0, std430) readonly buffer A { float data_a[]; };
 layout(binding = 1, std430) writeonly buffer D { uint data_d[]; };
 layout(binding = 2, std430) writeonly buffer S { float data_s[]; };
 
-shared float values[256];
-shared float maxima[64];
+shared float values[GROUP_SIZE];
+shared float maxima[GROUP_THREADS];
 
 void transform_group(const uint row, const uint group) {
     const uint tid = gl_LocalInvocationID.x;
-    const uint base_offset = row * p.k + group * 256;
+    const uint base_offset = row * p.k + group * GROUP_SIZE;
 
     [[unroll]]
     for (uint i = 0; i < 4; ++i) {
-        const uint index = tid + i * 64;
-        values[index] = data_a[base_offset + index] * (1.0 / 16.0);
+        const uint index = tid + i * GROUP_THREADS;
+        values[index] = data_a[base_offset + index] * HADAMARD_NORM;
     }
     barrier();
 
     [[unroll]]
-    for (uint stride = 1; stride < 256; stride *= 4) {
+    for (uint stride = 1; stride < GROUP_SIZE; stride *= 4) {
         const uint base = (tid / stride) * 4 * stride + tid % stride;
         const uint i0 = base;
         const uint i1 = i0 + stride;
@@ -54,14 +68,14 @@ uint quantize_value(const float value, const float inv_scale) {
 
 void quantize_row(const uint row) {
     const uint tid = gl_LocalInvocationID.x;
-    const uint groups = p.k / 256;
+    const uint groups = p.k / GROUP_SIZE;
     float local_max = 0.0;
 
     for (uint group = 0; group < groups; ++group) {
         transform_group(row, group);
         [[unroll]]
         for (uint i = 0; i < 4; ++i) {
-            local_max = max(local_max, abs(values[tid + i * 64]));
+            local_max = max(local_max, abs(values[tid + i * GROUP_THREADS]));
         }
         barrier();
     }
@@ -69,7 +83,7 @@ void quantize_row(const uint row) {
     maxima[tid] = local_max;
     barrier();
     [[unroll]]
-    for (uint stride = 32; stride > 0; stride >>= 1) {
+    for (uint stride = GROUP_THREADS / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             maxima[tid] = max(maxima[tid], maxima[tid + stride]);
         }
@@ -90,7 +104,7 @@ void quantize_row(const uint row) {
                           | (quantize_value(values[index + 1], inv_scale) << 8)
                           | (quantize_value(values[index + 2], inv_scale) << 16)
                           | (quantize_value(values[index + 3], inv_scale) << 24);
-        data_d[(row * p.k + group * 256) / 4 + tid] = packed;
+        data_d[(row * p.k + group * GROUP_SIZE) / 4 + tid] = packed;
         barrier();
     }
 }
