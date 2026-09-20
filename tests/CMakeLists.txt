@@ -159,6 +159,14 @@ endif()
 # undefine NDEBUG so asserts don't get disabled in tests
 add_definitions(-UNDEBUG)
 
+if (GGML_CUDA)
+    enable_language(CUDA)
+    add_executable(test_sage_attn test_sage_attn.cpp test_sage_attn_helpers.cu)
+    target_link_libraries(test_sage_attn PRIVATE ggml)
+    add_test(NAME test_sage_attn COMMAND $<TARGET_FILE:test_sage_attn>)
+    set_tests_properties(test_sage_attn PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 #
 # test-backend-ops
 

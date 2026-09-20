@@ -1114,9 +1114,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "QUANTIZE_I8_CONVROT",
+    "SAGE_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,9 +1232,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "quantize_i8_convrot(x)",
+    "sage_attn(x,y,z)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5531,6 +5533,29 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+
+struct ggml_tensor * ggml_sage_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        float                 scale,
+        enum ggml_sage_attn_mode mode) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v));
+    GGML_ASSERT(q->ne[0] == k->ne[0] && ggml_are_same_shape(k, v));
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0 && q->ne[3] == k->ne[3]);
+    GGML_ASSERT(isfinite(scale) && scale > 0.0f);
+    GGML_ASSERT(mode >= GGML_SAGE_ATTN_AUTO && mode <= GGML_SAGE_ATTN_2_PLUS_PLUS);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[2], q->ne[1], q->ne[3]);
+    result->op = GGML_OP_SAGE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    ggml_set_op_params(result, &scale, sizeof(scale));
+    ggml_set_op_params_i32(result, 1, mode);
+    return result;
+}
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,

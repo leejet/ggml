@@ -593,6 +593,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_QUANTIZE_I8_CONVROT,
+        GGML_OP_SAGE_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -2443,6 +2444,22 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    enum ggml_sage_attn_mode {
+        GGML_SAGE_ATTN_AUTO = 0,
+        GGML_SAGE_ATTN_2,
+        GGML_SAGE_ATTN_2_PLUS_PLUS,
+    };
+
+    // Q/K: contiguous F32 [D, tokens, heads, batch], V: contiguous F16 in the same layout.
+    // Output: F32 [D, query heads, query tokens, batch]. CUDA-only, unmasked inference.
+    GGML_API struct ggml_tensor * ggml_sage_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            float                 scale,
+            enum ggml_sage_attn_mode mode);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

@@ -151,6 +151,9 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (op->op == GGML_OP_SAGE_ATTN) {
+        return false;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
