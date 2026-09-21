@@ -1115,9 +1115,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "QUANTIZE_I8_CONVROT",
     "SAGE_ATTN",
+    "SOL_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1233,9 +1234,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "quantize_i8_convrot(x)",
     "sage_attn(x,y,z)",
+    "sol_attn(x,y,z)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5554,6 +5556,27 @@ struct ggml_tensor * ggml_sage_attn(
     result->src[2] = v;
     ggml_set_op_params(result, &scale, sizeof(scale));
     ggml_set_op_params_i32(result, 1, mode);
+    return result;
+}
+
+struct ggml_tensor* ggml_sol_attn(
+    struct ggml_context* ctx,
+    struct ggml_tensor* q,
+    struct ggml_tensor* k,
+    struct ggml_tensor* v,
+    float scale,
+    float tau) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v));
+    GGML_ASSERT(q->ne[0] == 128 && q->ne[1] > 0 && ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v));
+    GGML_ASSERT(isfinite(scale) && scale > 0.0f && isfinite(tau));
+    struct ggml_tensor* result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[2], q->ne[1], q->ne[3]);
+    result->op                 = GGML_OP_SOL_ATTN;
+    result->src[0]             = q;
+    result->src[1]             = k;
+    result->src[2]             = v;
+    const float params[]       = {scale, tau};
+    ggml_set_op_params(result, params, sizeof(params));
     return result;
 }
 
