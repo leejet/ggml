@@ -6,11 +6,9 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
-    const uint col = gl_GlobalInvocationID.x;
-
-    if (col >= p.ne20) {
-        return;
-    }
+    // Grid-stride loop on x: ne20 may exceed the maxComputeWorkGroupCount
+    // limit of the x axis.
+    for (uint col = gl_GlobalInvocationID.x; col < p.ne20; col += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
 
     for (uint row = gl_GlobalInvocationID.y; row < p.ne21; row += gl_WorkGroupSize.y * gl_NumWorkGroups.y) {
         float sum = 0.0f;
@@ -21,5 +19,6 @@ void main() {
         }
 
         data_d[get_doffset() + row*p.nb21 + col*p.nb20] = sum;
+    }
     }
 }

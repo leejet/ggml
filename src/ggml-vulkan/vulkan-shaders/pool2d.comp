@@ -26,11 +26,9 @@ layout(binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout(binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
 void main() {
-    const uint idx = gl_GlobalInvocationID.x;
-    if (idx >= p.pelements) {
-        return;
-    }
-
+    // Grid-stride loop: the number of pooled elements may exceed the
+    // maxComputeWorkGroupCount limit of the x axis.
+    for (uint idx = gl_GlobalInvocationID.x; idx < p.pelements; idx += gl_NumWorkGroups.x * gl_WorkGroupSize.x) {
     const uint O_HW = p.OW * p.OH;
 
     const uint nc = idx / O_HW;
@@ -71,4 +69,5 @@ void main() {
     }
 
     data_d[nc * O_HW + cur_oh * p.OW + cur_ow] = res;
+    }
 }

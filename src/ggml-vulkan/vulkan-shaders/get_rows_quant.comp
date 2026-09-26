@@ -9,15 +9,13 @@
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
-    const uint i00 = (gl_GlobalInvocationID.x)*2;
-
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-    if (i00 >= p.ne00) {
-        return;
-    }
+    // Grid-stride loop on x: ne00 may exceed the maxComputeWorkGroupCount
+    // limit of the x axis. Each thread covers 2 elements.
+    for (uint i00 = (gl_GlobalInvocationID.x)*2; i00 < p.ne00; i00 += gl_WorkGroupSize.x * gl_NumWorkGroups.x * 2) {
 
     uint gid_z = gl_GlobalInvocationID.z;
     while (gid_z < p.ne11 * p.ne12) {
@@ -47,5 +45,6 @@ void main() {
             gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
         }
         gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
+    }
     }
 }
