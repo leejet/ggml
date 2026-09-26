@@ -82,6 +82,47 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
 endif()
 
+# -mcumode: scalar-unit mode splits the scalar pipeline per wave; benefits
+# LDS-heavy MMQ kernels (shared LDS/SALU pressure in wave32). Applied to the
+# w4 convrot kernel file only - a global flag would change every kernel.
+# -mwavefrontsize64: clang's gfx1100 default is wave32 (verified via
+# clang-offload-bundler + llvm-readobj); wave64 halves the waves per block
+# (4 vs 8), doubling per-wave ILP scope. Bench A/B against the wave32 build.
+# GFX10 GUARD (2026-09-18): ROCm 10.0 clang 23 segfaults in LLVM
+# BranchRelaxation (SIInstrInfo::getInstSizeInBytes) compiling this
+# kernel's wave64 codegen for gfx1030 - at any opt level, with or without
+# -mcumode; wave32 compiles clean (verified on the failing WSL build).
+# Tuning was measured on gfx1100 only; gfx10 targets keep the compiler
+# default (wave32) until the compiler bug is fixed and the win is
+# re-benched on RDNA2.
+if (NOT CMAKE_HIP_ARCHITECTURES MATCHES "gfx10")
+    set_source_files_properties(../ggml-cuda/mmq-w4-convrot.cu PROPERTIES
+        COMPILE_OPTIONS "-mcumode;-mwavefrontsize64")
+endif()
+
+# w4a8 WMMA (gfx11): benched 2.08x SLOWER than dp4a on 7900 XTX (5.69
+# vs 2.74 s/it) - RDNA3's wmma iu8 shares one matrix pipe per WGP and
+# cannot co-execute with VALU, so a block's 4 waves serialize on it. Keep
+# disabled for gfx11. The dispatch skeleton in mmq-w4-convrot.cu
+# (GGML_W4A8_WMMA_GFX11 define + runtime cc guard) stays for the gfx12
+# port below, where the matrix pipe is 4x wider and VALU co-executes.
+# set_property(SOURCE ../ggml-cuda/mmq-w4-convrot.cu APPEND PROPERTY
+#     COMPILE_OPTIONS "-DGGML_W4A8_WMMA_GFX11=1")
+
+# w4a8 WMMA (gfx12/RDNA4): port of the gfx11 kernel to the gfx12 wave64
+# intrinsic - each lane supplies one 4-byte A/B slice (no replicated rows),
+# so decode work per wave drops 4x vs gfx11. Runs under this file's
+# -mwavefrontsize64 (unlike the w32 gfx12 intrinsic, which needs
+# wavefrontsize32 and would fight the wave64 tuning above). Compile-
+# verified on gfx1201 only: no RDNA4 hardware was available for the fixture
+# gate or a bench. Auto-selected when the build carries a gfx12 target
+# (runtime cc guard keeps other GPUs on dp4a); the one-time "w4a8 convrot
+# kernel:" debug log names the selected path.
+if (CMAKE_HIP_ARCHITECTURES MATCHES "gfx12")
+    set_property(SOURCE ../ggml-cuda/mmq-w4-convrot.cu APPEND PROPERTY
+        COMPILE_OPTIONS "-DGGML_W4A8_WMMA_GFX12=1")
+endif()
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}

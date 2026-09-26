@@ -32,6 +32,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmq-w4-convrot.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1347,7 +1348,7 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 __global__ void quantize_rowwise_i8_cuda(const float * src, int8_t * dst, float * scales, int64_t k, int64_t rows) {
     const int64_t row = blockIdx.x;
     const int tid     = threadIdx.x;
@@ -1391,12 +1392,14 @@ __global__ void quantize_rowwise_i8_cuda(const float * src, int8_t * dst, float 
     }
 }
 
+template <int group_size>
 __global__ void quantize_rowwise_i8_convrot_cuda(
         const float * src, int8_t * dst, float * scales,
         int64_t k, int64_t rows, int64_t dst_stride) {
-    constexpr int group_size      = 256;
     constexpr int group_threads   = group_size / 4;
     constexpr int groups_per_wave = 1024 / group_threads;
+    // H4 carries a 1/2 normalization, applied log4(group_size) times.
+    constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
 
     const int64_t row = blockIdx.x;
     const int tid     = threadIdx.x;
@@ -1410,7 +1413,7 @@ __global__ void quantize_rowwise_i8_convrot_cuda(
     int8_t * dst_row      = dst + row * dst_stride;
 
     for (int64_t i = tid; i < k; i += blockDim.x) {
-        values[i] = src_row[i] * (1.0f / 16.0f);
+        values[i] = src_row[i] * hadamard_norm;
     }
     __syncthreads();
 
@@ -1480,27 +1483,32 @@ __global__ void quantize_rowwise_i8_convrot_cuda(
     }
 }
 
+template <int group_size>
 __global__ void convrot_group_amax_i8_cuda(
         const float * src, float * partial_max, int64_t k, int64_t groups, int64_t total_groups) {
+    constexpr int group_threads = group_size / 4;
+    // H4 carries a 1/2 normalization, applied log4(group_size) times.
+    constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
+
     const int64_t index = blockIdx.x;
     const int tid       = threadIdx.x;
     if (index >= total_groups) {
         return;
     }
 
-    __shared__ float values[256];
-    __shared__ float maxima[2];
+    __shared__ float values[group_size];
+    __shared__ float maxima[group_threads];
     const int64_t row   = index / groups;
     const int64_t group = index - row * groups;
-    const float * input = src + row * k + group * 256;
-    values[tid]       = input[tid] * (1.0f / 16.0f);
-    values[tid + 64]  = input[tid + 64] * (1.0f / 16.0f);
-    values[tid + 128] = input[tid + 128] * (1.0f / 16.0f);
-    values[tid + 192] = input[tid + 192] * (1.0f / 16.0f);
+    const float * input = src + row * k + group * group_size;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        values[tid + j * group_threads] = input[tid + j * group_threads] * hadamard_norm;
+    }
     __syncthreads();
 
 #pragma unroll
-    for (int stride = 1; stride < 256; stride *= 4) {
+    for (int stride = 1; stride < group_size; stride *= 4) {
         const int base   = (tid / stride) * 4 * stride + tid % stride;
         const int i0     = base;
         const int i1     = i0 + stride;
@@ -1517,18 +1525,21 @@ __global__ void convrot_group_amax_i8_cuda(
         __syncthreads();
     }
 
-    float value = fmaxf(fabsf(values[tid]), fabsf(values[tid + 64]));
-    value       = fmaxf(value, fabsf(values[tid + 128]));
-    value       = fmaxf(value, fabsf(values[tid + 192]));
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+    float value = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        value = fmaxf(value, fabsf(values[tid + j * group_threads]));
     }
-    if ((tid & 31) == 0) {
-        maxima[tid >> 5] = value;
-    }
+    maxima[tid] = value;
     __syncthreads();
+    for (int stride = group_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            maxima[tid] = fmaxf(maxima[tid], maxima[tid + stride]);
+        }
+        __syncthreads();
+    }
     if (tid == 0) {
-        partial_max[index] = fmaxf(maxima[0], maxima[1]);
+        partial_max[index] = maxima[0];
     }
 }
 
@@ -1558,28 +1569,33 @@ __global__ void reduce_convrot_row_amax_i8_cuda(
     }
 }
 
+template <int group_size>
 __global__ void convrot_group_quantize_i8_cuda(
         const float * src, int8_t * dst, const float * scales,
         int64_t k, int64_t groups, int64_t total_groups, int64_t dst_stride) {
+    constexpr int group_threads = group_size / 4;
+    // H4 carries a 1/2 normalization, applied log4(group_size) times.
+    constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
+
     const int64_t index = blockIdx.x;
     const int tid       = threadIdx.x;
     if (index >= total_groups) {
         return;
     }
 
-    __shared__ float values[256];
+    __shared__ float values[group_size];
     const int64_t row   = index / groups;
     const int64_t group = index - row * groups;
-    const float * input = src + row * k + group * 256;
-    int8_t * output     = dst + row * dst_stride + group * 256;
-    values[tid]       = input[tid] * (1.0f / 16.0f);
-    values[tid + 64]  = input[tid + 64] * (1.0f / 16.0f);
-    values[tid + 128] = input[tid + 128] * (1.0f / 16.0f);
-    values[tid + 192] = input[tid + 192] * (1.0f / 16.0f);
+    const float * input = src + row * k + group * group_size;
+    int8_t * output     = dst + row * dst_stride + group * group_size;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        values[tid + j * group_threads] = input[tid + j * group_threads] * hadamard_norm;
+    }
     __syncthreads();
 
 #pragma unroll
-    for (int stride = 1; stride < 256; stride *= 4) {
+    for (int stride = 1; stride < group_size; stride *= 4) {
         const int base   = (tid / stride) * 4 * stride + tid % stride;
         const int i0     = base;
         const int i1     = i0 + stride;
@@ -1598,12 +1614,12 @@ __global__ void convrot_group_quantize_i8_cuda(
 
     const float row_scale = scales[row];
     const float inv_scale = row_scale == 0.0f ? 0.0f : 1.0f / row_scale;
-    const int indices[4]  = { tid, tid + 64, tid + 128, tid + 192 };
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int value = row_scale == 0.0f ? 0 : __float2int_rn(values[indices[i]] * inv_scale);
+    for (int j = 0; j < 4; ++j) {
+        const int element = tid + j * group_threads;
+        int value = row_scale == 0.0f ? 0 : __float2int_rn(values[element] * inv_scale);
         value     = max(-127, min(127, value));
-        output[indices[i]] = (int8_t)value;
+        output[element] = (int8_t)value;
     }
     if (group == 0 && tid == 0 && dst_stride != k) {
         *((float *)(dst + row * dst_stride + k)) = row_scale;
@@ -1637,7 +1653,8 @@ static void ggml_cuda_quantize_i8_convrot(
         int64_t k,
         int64_t rows,
         int64_t rows_padded,
-        int64_t dst_stride) {
+        int64_t dst_stride,
+        int group_size) {
     cudaStream_t stream = ctx.stream();
     if (rows_padded > rows) {
         CUDA_CHECK(cudaMemsetAsync(
@@ -1647,26 +1664,43 @@ static void ggml_cuda_quantize_i8_convrot(
     const size_t nbytes_shared = (size_t)k * sizeof(float);
     const size_t smpbo         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
     if (nbytes_shared + 128 <= smpbo) {
-        CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda, smpbo - 128);
-        quantize_rowwise_i8_convrot_cuda<<<rows, 1024, nbytes_shared, stream>>>(
-            src, dst, scales, k, rows, dst_stride);
+        if (group_size == 64) {
+            CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda<64>, smpbo - 128);
+            quantize_rowwise_i8_convrot_cuda<64><<<rows, 1024, nbytes_shared, stream>>>(
+                src, dst, scales, k, rows, dst_stride);
+        } else {
+            CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda<256>, smpbo - 128);
+            quantize_rowwise_i8_convrot_cuda<256><<<rows, 1024, nbytes_shared, stream>>>(
+                src, dst, scales, k, rows, dst_stride);
+        }
         return;
     }
 
-    const int64_t groups       = k / 256;
+    const int64_t groups       = k / group_size;
     const int64_t total_groups = rows * groups;
+    const int group_threads    = group_size / 4;
     ggml_cuda_pool_alloc<float> partial_max(ctx.pool(), total_groups);
     ggml_cuda_pool_alloc<float> packed_scales(ctx.pool());
     float * scales_d = scales;
     if (scales_d == nullptr) {
         scales_d = packed_scales.alloc(rows);
     }
-    convrot_group_amax_i8_cuda<<<total_groups, 64, 0, stream>>>(
-        src, partial_max.get(), k, groups, total_groups);
+    if (group_size == 64) {
+        convrot_group_amax_i8_cuda<64><<<total_groups, group_threads, 0, stream>>>(
+            src, partial_max.get(), k, groups, total_groups);
+    } else {
+        convrot_group_amax_i8_cuda<256><<<total_groups, group_threads, 0, stream>>>(
+            src, partial_max.get(), k, groups, total_groups);
+    }
     reduce_convrot_row_amax_i8_cuda<<<rows, 256, 0, stream>>>(
         partial_max.get(), scales_d, groups, rows);
-    convrot_group_quantize_i8_cuda<<<total_groups, 64, 0, stream>>>(
-        src, dst, scales_d, k, groups, total_groups, dst_stride);
+    if (group_size == 64) {
+        convrot_group_quantize_i8_cuda<64><<<total_groups, group_threads, 0, stream>>>(
+            src, dst, scales_d, k, groups, total_groups, dst_stride);
+    } else {
+        convrot_group_quantize_i8_cuda<256><<<total_groups, group_threads, 0, stream>>>(
+            src, dst, scales_d, k, groups, total_groups, dst_stride);
+    }
 }
 
 static bool ggml_cuda_op_quantize_i8_convrot(
@@ -1679,7 +1713,7 @@ static bool ggml_cuda_op_quantize_i8_convrot(
     const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + src->ne[0] - 1) / src->ne[0];
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I8 ||
         !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
-        group_size != 256 || src->ne[0] % group_size != 0 ||
+        (group_size != 64 && group_size != 256) || src->ne[0] % group_size != 0 ||
         dst->ne[0] != src->ne[0] || dst->ne[1] != rows_padded + scale_rows) {
         return false;
     }
@@ -1693,7 +1727,8 @@ static bool ggml_cuda_op_quantize_i8_convrot(
         src->ne[0],
         rows,
         rows_padded,
-        src->ne[0]);
+        src->ne[0],
+        group_size);
     return true;
 }
 
@@ -1721,7 +1756,7 @@ static void ggml_cuda_mul_mat_i8(
     GGML_ASSERT(src1->ne[0] == k);
     GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
                                   src1->ne[1] == rows_padded + scale_rows));
-    GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 256);
+    GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 64 || convrot_group_size == 256);
 
     ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
     ggml_cuda_pool_alloc<float> scales(ctx.pool());
@@ -1741,7 +1776,7 @@ static void ggml_cuda_mul_mat_i8(
             (const float *)src1->data, qdata_d, scales_d, k, rows);
     } else {
         ggml_cuda_quantize_i8_convrot(
-            ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k);
+            ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k, convrot_group_size);
     }
 
     const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
@@ -1762,6 +1797,80 @@ static void ggml_cuda_mul_mat_i8(
     dequantize_i32_rows_cuda<<<dequant_grid, 256, 0, stream>>>(
         accum.get(), scales_d, weight_scales, bias,
         (float *)dst->data, n, rows);
+}
+
+// packed-w4 convrot mulmat (see ggml_mul_mat_w4_convrot): same activation
+// pipeline as the int8 path, kind-specific weight decode on top of the dp4a /
+// LUT kernels in mmq-w4-convrot.cu. No BLAS route: cublasGemmEx cannot consume packed
+// nibbles.
+static void ggml_cuda_mul_mat_w4(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_I8);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int w4_kind = ggml_get_op_params_i32(dst, 3);
+    GGML_ASSERT(w4_kind == GGML_W4_CONVROT_KIND_W4A4 || w4_kind == GGML_W4_CONVROT_KIND_W4A8);
+
+    const int64_t packed_k    = src0->ne[0];
+    const int64_t k           = 2 * packed_k;
+    const int64_t n           = src0->ne[1];
+    const int64_t rows        = ggml_nrows(dst);
+    const bool prequantized   = src1->type == GGML_TYPE_I8;
+    const int64_t rows_padded = GGML_PAD(rows, 4);
+    const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + k - 1) / k;
+    const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
+    GGML_ASSERT(src1->ne[0] == k);
+    GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
+                                  src1->ne[1] == rows_padded + scale_rows));
+    // 64-k groups need the templated kernels from the h64 PR; this PR ships 256-only
+    GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 64 || convrot_group_size == 256);
+
+    ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
+    ggml_cuda_pool_alloc<float> scales(ctx.pool());
+    cudaStream_t stream = ctx.stream();
+    int8_t * qdata_d    = prequantized ? (int8_t *)src1->data : qdata.alloc((size_t)k * rows_padded);
+    float * scales_d    = prequantized
+        ? (float *)((int8_t *)src1->data + k * rows_padded)
+        : scales.alloc(rows);
+
+    if (prequantized) {
+        GGML_ASSERT(src1->op == GGML_OP_QUANTIZE_I8_CONVROT);
+    } else if (convrot_group_size == 0) {
+        if (rows_padded > rows) {
+            CUDA_CHECK(cudaMemsetAsync(qdata_d + k * rows, 0, (size_t)k * (rows_padded - rows), stream));
+        }
+        quantize_rowwise_i8_cuda<<<rows, 256, 0, stream>>>(
+            (const float *)src1->data, qdata_d, scales_d, k, rows);
+    } else {
+        ggml_cuda_quantize_i8_convrot(
+            ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k, convrot_group_size);
+    }
+
+    const float * bias = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
+
+    if (w4_kind == GGML_W4_CONVROT_KIND_W4A4) {
+        ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows);
+        ggml_cuda_mul_mat_w4a4_convrot_dp4a(
+            ctx, (const int8_t *)src0->data, qdata_d, accum.get(), n, rows, packed_k, stream);
+        const dim3 dequant_grid((n + 255) / 256, rows, 1);
+        dequantize_i32_rows_cuda<<<dequant_grid, 256, 0, stream>>>(
+            accum.get(), scales_d, (const float *)dst->src[2]->data, bias,
+            (float *)dst->data, n, rows);
+    } else {
+        ggml_cuda_mul_mat_w4a8_convrot_dp4a(
+            ctx, (const int8_t *)src0->data, qdata_d,
+            (const float *)dst->src[2]->data, (const float *)dst->src[5]->data,
+            (const uint8_t *)dst->src[4]->data, scales_d, bias, (float *)dst->data,
+            n, rows, k, stream);
+    }
 }
 #endif
 
@@ -2440,6 +2549,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (src0->type == GGML_TYPE_I8) {
+#if !defined(GGML_USE_MUSA)
+        if (ggml_get_op_params_i32(dst, 3) != 0) {
+            ggml_cuda_mul_mat_w4(ctx, src0, src1, dst);
+            return;
+        }
+#endif
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         ggml_cuda_mul_mat_i8(ctx, src0, src1, dst);
 #else
@@ -2856,7 +2971,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
         case GGML_OP_QUANTIZE_I8_CONVROT:
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
             GGML_ASSERT(ggml_cuda_op_quantize_i8_convrot(ctx, dst->src[0], dst, ggml_get_op_params_i32(dst, 0)));
 #else
             GGML_ABORT("INT8 convrot quantization is only implemented for CUDA");
@@ -5455,31 +5570,59 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
                 if (a->type == GGML_TYPE_I8) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
+                    const int w4_kind = ggml_get_op_params_i32(op, 3);
+                    if (w4_kind != 0 && w4_kind != GGML_W4_CONVROT_KIND_W4A4 &&
+                        w4_kind != GGML_W4_CONVROT_KIND_W4A8) {
+                        return false; // packed-w4 convrot: unknown kind
+                    }
+                    // int8/W4A4: per-row weight scales; W4A8: codebook + s_channel/s_rel
                     const ggml_tensor * weight_scale = op->src[2];
+                    const ggml_tensor * s_rel        = op->src[4];
+                    const ggml_tensor * s_channel    = op->src[5];
                     const ggml_tensor * bias         = op->src[3];
                     const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
                     const ggml_tensor * packed_src   = b->src[0];
+                    const int64_t k = w4_kind != 0 ? 2 * a->ne[0] : a->ne[0];
                     const int64_t packed_rows = packed_src != nullptr ? GGML_PAD(ggml_nrows(packed_src), 4) : 0;
                     const int64_t packed_scale_rows = packed_src != nullptr
-                        ? (ggml_nrows(packed_src) * (int64_t)sizeof(float) + a->ne[0] - 1) / a->ne[0]
+                        ? (ggml_nrows(packed_src) * (int64_t)sizeof(float) + k - 1) / k
                         : 0;
                     const bool packed_input          = b->type == GGML_TYPE_I8 &&
-                                                       b->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                                       packed_src != nullptr && b->ne[0] == a->ne[0] &&
+                                                       packed_src != nullptr && b->ne[0] == k &&
                                                        b->ne[1] == packed_rows + packed_scale_rows;
+                    const bool weight_scale_ok = w4_kind == GGML_W4_CONVROT_KIND_W4A8
+                        ? (weight_scale != nullptr && weight_scale->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous(weight_scale) && ggml_nelements(weight_scale) == 16 &&
+                           s_channel != nullptr && s_channel->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous(s_channel) && ggml_nelements(s_channel) == a->ne[1] &&
+                           s_rel != nullptr && s_rel->type == GGML_TYPE_F8_E4M3 &&
+                           ggml_is_contiguous(s_rel) && s_rel->ne[0] == a->ne[0] / 8 &&
+                           s_rel->ne[1] == a->ne[1] && a->ne[0] % 8 == 0)
+                        : (weight_scale == nullptr ||
+                           (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) &&
+                            ggml_nelements(weight_scale) == a->ne[1]));
                     return op->op == GGML_OP_MUL_MAT && (b->type == GGML_TYPE_F32 || packed_input) &&
                            op->type == GGML_TYPE_F32 && a->ne[0] % 4 == 0 && a->ne[1] % 4 == 0 &&
                            a->ne[2] == 1 && a->ne[3] == 1 &&
                            ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
-                           (weight_scale == nullptr ||
-                            (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) &&
-                             ggml_nelements(weight_scale) == a->ne[1])) &&
+                           weight_scale_ok &&
                            (bias == nullptr ||
                             (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
                              ggml_nelements(bias) == a->ne[1])) &&
-                           (convrot_group_size == 0 || (convrot_group_size == 256 && a->ne[0] % 256 == 0)) &&
-                           turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc);
+                           (convrot_group_size == 0 ||
+                            ((convrot_group_size == 64 || convrot_group_size == 256) &&
+                             k % convrot_group_size == 0)) &&
+#if !defined(GGML_USE_HIP)
+                           // w4 runs on the dp4a/LUT kernels, no INT8 BLAS needed;
+                           // plain int8 keeps the CUDA-only Turing-MMA route
+                           (w4_kind != 0 ||
+                            (turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
+                             amd_wmma_available(ggml_cuda_info().devices[dev_ctx->device].cc) ||
+                             amd_mfma_available(ggml_cuda_info().devices[dev_ctx->device].cc)));
+#else
+                           (w4_kind != 0); // HIP: packed-w4 only until the INT8 HIP/BLAS PR lands
+#endif
 #else
                     return false;
 #endif
@@ -5874,7 +6017,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_QUANTIZE_I8_CONVROT:
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
             {
                 const ggml_tensor * src = op->src[0];
                 const int group_size    = ggml_get_op_params_i32(op, 0);
@@ -5885,7 +6028,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     : 0;
                 return src != nullptr && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
                        ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
-                       group_size == 256 && src->ne[0] % group_size == 0 &&
+                       (group_size == 64 || group_size == 256) && src->ne[0] % group_size == 0 &&
                        op->ne[0] == src->ne[0] && op->ne[1] == rows_padded + scale_rows;
             }
 #else

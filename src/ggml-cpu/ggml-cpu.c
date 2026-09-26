@@ -1212,8 +1212,9 @@ static void ggml_compute_forward_mul_mat_i8_f32(
     const size_t scale_offset = GGML_PAD(qbytes, sizeof(float));
 
     GGML_ASSERT(src1->ne[0] == k);
-    GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                  src1->ne[1] == rows_padded + scale_rows));
+    // src1->op may be a scheduler CPY copy, so the packed layout is trusted
+    // from the dispatch shape check rather than the op marker
+    GGML_ASSERT(!prequantized || src1->ne[1] == rows_padded + scale_rows);
     GGML_ASSERT(convrot_group_size == 0 || (convrot_group_size <= 256 && k % convrot_group_size == 0));
     GGML_ASSERT(prequantized || params->wsize >= scale_offset + (size_t)rows * sizeof(float));
 
@@ -1306,6 +1307,157 @@ static void ggml_compute_forward_mul_mat_i8_f32(
     }
 }
 
+// MUL_MAT for the packed-w4 convrot formats (see ggml_mul_mat_w4_convrot).
+// Input handling (inline Hadamard+int8 quantize, or the packed output of
+// GGML_OP_QUANTIZE_I8_CONVROT) is identical to the int8 path above; only the
+// weight decode and the epilogue differ per kind.
+static void ggml_compute_forward_mul_mat_w4_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_I8);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int w4_kind = ggml_get_op_params_i32(dst, 3);
+    GGML_ASSERT(w4_kind == GGML_W4_CONVROT_KIND_W4A4 || w4_kind == GGML_W4_CONVROT_KIND_W4A8);
+
+    const int64_t packed_k = src0->ne[0];
+    const int64_t k        = 2 * packed_k;
+    const int64_t n        = src0->ne[1];
+    const int64_t rows     = ggml_nrows(dst);
+    const bool prequantized = src1->type == GGML_TYPE_I8;
+    const int64_t rows_padded = GGML_PAD(rows, 4);
+    const int64_t scale_rows = (rows * (int64_t)sizeof(float) + k - 1) / k;
+    const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
+    const size_t qbytes = prequantized ? 0 : (size_t)ggml_nelements(src1) * sizeof(int8_t);
+    const size_t scale_offset = GGML_PAD(qbytes, sizeof(float));
+
+    GGML_ASSERT(src1->ne[0] == k);
+    GGML_ASSERT(!prequantized || src1->ne[1] == rows_padded + scale_rows);
+    GGML_ASSERT(convrot_group_size == 0 || (convrot_group_size <= 256 && k % convrot_group_size == 0));
+    GGML_ASSERT(prequantized || params->wsize >= scale_offset + (size_t)rows * sizeof(float));
+
+    int8_t * qdata = prequantized ? (int8_t *)src1->data : (int8_t *)params->wdata;
+    float * scales = prequantized ? NULL : (float *)((char *)params->wdata + scale_offset);
+    const float * packed_scales = prequantized
+        ? (const float *)((const int8_t *)src1->data + k * rows_padded)
+        : NULL;
+    const float * src1_data = prequantized ? NULL : (const float *)src1->data;
+
+    for (int64_t row = params->ith; !prequantized && row < rows; row += params->nth) {
+        const float * src_row = src1_data + row * k;
+        int8_t * qrow         = qdata + row * k;
+        float amax            = 0.0f;
+        if (convrot_group_size == 0) {
+            for (int64_t i = 0; i < k; ++i) {
+                amax = MAX(amax, fabsf(src_row[i]));
+            }
+        } else {
+            float values[256];
+            for (int64_t group = 0; group < k; group += convrot_group_size) {
+                memcpy(values, src_row + group, (size_t)convrot_group_size * sizeof(float));
+                ggml_regular_hadamard_group_f32(values, convrot_group_size);
+                for (int i = 0; i < convrot_group_size; ++i) {
+                    amax = MAX(amax, fabsf(values[i]));
+                }
+            }
+        }
+
+        const float row_scale = amax / 127.0f;
+        scales[row]           = row_scale;
+        if (row_scale == 0.0f) {
+            memset(qrow, 0, (size_t)k);
+            continue;
+        }
+
+        const float inv_scale = 1.0f / row_scale;
+        if (convrot_group_size == 0) {
+            for (int64_t i = 0; i < k; ++i) {
+                int value = (int)lrintf(src_row[i] * inv_scale);
+                value     = MAX(-127, MIN(127, value));
+                qrow[i]   = (int8_t)value;
+            }
+        } else {
+            float values[256];
+            for (int64_t group = 0; group < k; group += convrot_group_size) {
+                memcpy(values, src_row + group, (size_t)convrot_group_size * sizeof(float));
+                ggml_regular_hadamard_group_f32(values, convrot_group_size);
+                for (int i = 0; i < convrot_group_size; ++i) {
+                    int value = (int)lrintf(values[i] * inv_scale);
+                    value     = MAX(-127, MIN(127, value));
+                    qrow[group + i] = (int8_t)value;
+                }
+            }
+        }
+    }
+
+    if (!prequantized) {
+        ggml_barrier(params->threadpool);
+    }
+
+    const int64_t s_rel_groups = k / 16;
+    const uint8_t * s_rel_data = (dst->src[4] != NULL) ? (const uint8_t *)dst->src[4]->data : NULL;
+    const ggml_to_float_t f8_to_f32 = ggml_get_type_traits(GGML_TYPE_F8_E4M3)->to_float;
+
+    float * dst_data = (float *)dst->data;
+    const int64_t output_elements = n * rows;
+    for (int64_t index = params->ith; index < output_elements; index += params->nth) {
+        const int64_t output_row = index / n;
+        const int64_t i01        = index - output_row * n;
+        const uint8_t * packed_row = (const uint8_t *)((const char *)src0->data + i01 * src0->nb[1]);
+        const int8_t * activation_row = prequantized
+            ? (const int8_t *)((const char *)src1->data + output_row * src1->nb[1])
+            : qdata + output_row * k;
+
+        const float activation_scale = prequantized ? packed_scales[output_row] : scales[output_row];
+        float value;
+        if (w4_kind == GGML_W4_CONVROT_KIND_W4A4) {
+            int32_t sum = 0;
+            for (int64_t i = 0; i < k; ++i) {
+                const uint8_t byte = packed_row[i >> 1];
+                const int nib      = (int)((i & 1) ? (byte >> 4) : (byte & 0xF));
+                // 4-bit two's complement sign extension, exact on the int grid
+                sum += ((nib ^ 0x8) - 0x8) * (int32_t)activation_row[i];
+            }
+            value = (float)sum * activation_scale * ((const float *)dst->src[2]->data)[i01];
+        } else {
+            // src[2] is the raw F32 codebook [16]; src[5] is s_channel F32 [N];
+            // src[4] is s_rel as F8_E4M3 [K/16, N]. Fold cost is one LUT per group.
+            const float * codebook = (const float *)dst->src[2]->data;
+            const float * s_ch     = (const float *)dst->src[5]->data;
+            const uint8_t * srel_o = s_rel_data + i01 * s_rel_groups;
+            float sumf = 0.0f;
+            for (int64_t g = 0; g < s_rel_groups; ++g) {
+                float s_rel;
+                f8_to_f32(srel_o + g, &s_rel, 1);
+                const float sc = s_ch[i01];
+                float lut[16];
+                for (int c = 0; c < 16; ++c) {
+                    lut[c] = codebook[c] * (sc * s_rel);
+                }
+                for (int64_t t = 0; t < 16; ++t) {
+                    const int64_t i     = g * 16 + t;
+                    const uint8_t byte  = packed_row[i >> 1];
+                    const int code      = (int)((i & 1) ? (byte >> 4) : (byte & 0xF));
+                    sumf += lut[code] * (float)activation_row[i];
+                }
+            }
+            value = sumf * activation_scale;
+        }
+        if (dst->src[3] != NULL) {
+            value += ((const float *)dst->src[3]->data)[i01];
+        }
+        dst_data[index] = value;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1320,9 +1472,12 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_tensor * src1 = dst->src[1];
 
     if (src0->type == GGML_TYPE_I8 &&
-        (src1->type == GGML_TYPE_F32 ||
-         (src1->type == GGML_TYPE_I8 && src1->op == GGML_OP_QUANTIZE_I8_CONVROT))) {
-        ggml_compute_forward_mul_mat_i8_f32(params, dst);
+        (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I8)) {
+        if (ggml_get_op_params_i32(dst, 3) != 0) {
+            ggml_compute_forward_mul_mat_w4_f32(params, dst);
+        } else {
+            ggml_compute_forward_mul_mat_i8_f32(params, dst);
+        }
         return;
     }
 
@@ -1410,10 +1565,25 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    if (src0->type == GGML_TYPE_I8 && src1->type == GGML_TYPE_I8 &&
-        src1->op == GGML_OP_QUANTIZE_I8_CONVROT) {
-        ggml_compute_forward_mul_mat_i8_f32(params, dst);
-        return;
+    if (src0->type == GGML_TYPE_I8 && src1->type == GGML_TYPE_I8) {
+        // The backend scheduler evaluates supports_op on the original graph but
+        // executes rebuilt per-backend subgraphs in which cross-backend inputs
+        // are CPY copies, so src1->op may no longer read QUANTIZE_I8_CONVROT
+        // here. Detect the packed payload+scales layout by shape instead; the
+        // supports_op gate still uses the full op-based contract.
+        const int w4_kind_i8 = ggml_get_op_params_i32(dst, 3);
+        const int64_t nk     = w4_kind_i8 != 0 ? 2 * src0->ne[0] : src0->ne[0];
+        const int64_t nrows  = ggml_nrows(dst);
+        const bool packed_input = src1->ne[0] == nk &&
+            src1->ne[1] == GGML_PAD(nrows, 4) + (nrows * (int64_t)sizeof(float) + nk - 1) / nk;
+        if (packed_input) {
+            if (w4_kind_i8 != 0) {
+                ggml_compute_forward_mul_mat_w4_f32(params, dst);
+            } else {
+                ggml_compute_forward_mul_mat_i8_f32(params, dst);
+            }
+            return;
+        }
     }
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
