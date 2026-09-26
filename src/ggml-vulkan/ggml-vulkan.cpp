@@ -1631,6 +1631,7 @@ struct vk_op_topk_moe_push_constants {
 struct vk_op_add_id_push_constants {
     uint32_t ne0;
     uint32_t ne1;
+    uint32_t ne2;
     uint32_t s01;
     uint32_t s02;
     uint32_t s11;
@@ -1641,6 +1642,7 @@ struct vk_op_diag_mask_push_constants {
     uint32_t ncols;
     uint32_t rows_per_channel;
     int32_t n_past;
+    uint32_t nrows;
 };
 
 struct vk_op_rope_push_constants {
@@ -1771,6 +1773,7 @@ struct vk_op_timestep_embedding_push_constants {
     uint32_t nb1;
     uint32_t dim;
     uint32_t max_period;
+    uint32_t nrows;
 };
 
 struct vk_op_col2im_1d_push_constants {
@@ -6344,6 +6347,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->physical_device.getProperties2(&props2);
         device->properties = props2.properties;
+        // For testing dispatch clamping on devices with generous limits.
+        if (const char* e = getenv("GGML_VK_TEST_MAX_WG")) {
+            const uint32_t v = (uint32_t)atoi(e);
+            for (int i = 0; i < 3; i++) {
+                device->properties.limits.maxComputeWorkGroupCount[i] = v;
+            }
+            fprintf(stderr, "ggml_vulkan: GGML_VK_TEST_MAX_WG overriding maxComputeWorkGroupCount to %u\n", v);
+        }
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
 
@@ -12422,6 +12433,35 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     }
 
+    // maxComputeWorkGroupCount limits the number of workgroups on every axis.
+    // The shaders for the following ops iterate internally when their
+    // workgroup range is clamped (grid-stride loops), so it is safe to cap
+    // the element counts here.
+    switch (op) {
+    case GGML_OP_TIMESTEP_EMBEDDING:
+    case GGML_OP_CONV_TRANSPOSE_1D:
+    case GGML_OP_COL2IM_1D:
+    case GGML_OP_POOL_1D:
+    case GGML_OP_POOL_2D:
+    case GGML_OP_ADD_ID:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_GET_ROWS:
+    case GGML_OP_GET_ROWS_BACK:
+    case GGML_OP_DIAG_MASK_INF:
+    case GGML_OP_IM2COL_3D:
+        for (int i = 0; i < 3; i++) {
+            // These ops all use eagerly-created pipelines, so wg_denoms is set.
+            // wg_denoms can overflow uint32_t when multiplied by the limit
+            // (e.g. dim 0 on devices where the limit is 2^31-1).
+            GGML_ASSERT(pipeline->wg_denoms[i] != 0);
+            const uint64_t cap = uint64_t(ctx->device->properties.limits.maxComputeWorkGroupCount[i]) * pipeline->wg_denoms[i];
+            elements[i] = (uint32_t)std::min<uint64_t>(elements[i], cap);
+        }
+        break;
+    default:
+        break;
+    }
+
     if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
@@ -12712,6 +12752,7 @@ static void ggml_vk_add_id(ggml_backend_vk_context * ctx, vk_context& subctx, co
     ggml_vk_op_f32<vk_op_add_id_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_ADD_ID, {
         (uint32_t)dst->ne[0],
         (uint32_t)dst->ne[1],
+        (uint32_t)dst->ne[2],
         (uint32_t)src0->nb[1] / src0_type_size,
         (uint32_t)src0->nb[2] / src0_type_size,
         (uint32_t)src1->nb[1] / src1_type_size,
@@ -13542,7 +13583,7 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
 static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     int32_t * op_params = (int32_t *)dst->op_params;
-    ggml_vk_op_f32<vk_op_diag_mask_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_DIAG_MASK_INF, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0] });
+    ggml_vk_op_f32<vk_op_diag_mask_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_DIAG_MASK_INF, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], (uint32_t)ggml_nrows(src0) });
 }
 
 static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
@@ -13580,7 +13621,13 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
         src2 != nullptr
     };
 
-    if (ncols <= 16384) {
+    // For testing the large path on small inputs.
+    const char* sml = getenv("GGML_VK_TEST_SM_LARGE");
+    const uint32_t sm_large_threshold = sml ? (uint32_t)atoi(sml) : 16384;
+    if (sml) {
+        fprintf(stderr, "ggml_vulkan: GGML_VK_TEST_SM_LARGE overriding soft_max large threshold to %u\n", sm_large_threshold);
+    }
+    if (ncols <= sm_large_threshold) {
         ggml_vk_op_f32<vk_op_soft_max_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SOFT_MAX, std::move(pc));
     } else {
 
@@ -13608,7 +13655,12 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
 
-        std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
+        // The shaders iterate over rows internally when the workgroup
+        // range is clamped (grid-stride loop on y).
+        std::array<uint32_t, 3> elements = {
+            num_wgs,
+            std::min(nrows_x, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            1 };
 
         vk_pipeline pipeline1 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large1_f32_f16 : ctx->device->pipeline_soft_max_large1_f32;
         vk_pipeline pipeline2 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large2_f32_f16 : ctx->device->pipeline_soft_max_large2_f32;
@@ -14146,7 +14198,7 @@ static void ggml_vk_timestep_embedding(ggml_backend_vk_context * ctx, vk_context
     const uint32_t nb1 = dst->nb[1] / ggml_type_size(dst->type);
 
     ggml_vk_op_f32<vk_op_timestep_embedding_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_TIMESTEP_EMBEDDING, {
-        nb1, dim, max_period,
+        nb1, dim, max_period, (uint32_t)src0->ne[0],
     });
 }
 
@@ -14242,7 +14294,11 @@ static void ggml_vk_snake_dispatch_fused(ggml_backend_vk_context * ctx, vk_conte
     pc.ne0 = static_cast<uint32_t>(x->ne[0]);
     pc.ne1 = static_cast<uint32_t>(x->ne[1]);
 
-    std::array<uint32_t, 3> elements = { pc.ne0, pc.ne1, 1 };
+    // The shader iterates internally when the workgroup range is clamped.
+    std::array<uint32_t, 3> elements = {
+        (uint32_t)std::min<uint64_t>(pc.ne0, uint64_t(ctx->device->properties.limits.maxComputeWorkGroupCount[0]) * pipeline->wg_denoms[0]),
+        (uint32_t)std::min<uint64_t>(pc.ne1, uint64_t(ctx->device->properties.limits.maxComputeWorkGroupCount[1]) * pipeline->wg_denoms[1]),
+        1 };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, a_buf, inv_b_buf, dst_buf }, pc, elements);
 }
 

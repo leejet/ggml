@@ -4,8 +4,11 @@
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.y;
     const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
+
+    // Grid-stride loop: nrows_x may exceed the maxComputeWorkGroupCount
+    // limit of the y axis. vals is reused each iteration.
+    for (uint rowx = gl_WorkGroupID.y; rowx < p.nrows_x; rowx += gl_NumWorkGroups.y) {
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);
     const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;
@@ -14,10 +17,6 @@ void main() {
     uint rowy_start = 0;
     if (p.KY > 0) {
         rowy_start = i01 * p.nb11 + (i02 % p.ne12) * p.nb12 + (i03 % p.ne13) * p.nb13;
-    }
-
-    if (rowx >= p.nrows_x) {
-        return;
     }
 
     float slope = get_slope(rowx);
@@ -75,5 +74,10 @@ void main() {
     if (tid == 0) {
         sum = vals[0];
         data_s[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sum;
+    }
+
+    // Wait for all threads to finish reading vals before the next iteration
+    // overwrites it.
+    barrier();
     }
 }

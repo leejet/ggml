@@ -24,13 +24,15 @@ layout(push_constant) uniform PushConstants {
 };
 
 void main() {
-    const uint i1 = gl_GlobalInvocationID.x;
-    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
-    const uint i3 = gl_WorkGroupID.z;
-
-    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
-        return;
+    // Grid-stride loops: nr/n_t/n_s may exceed the maxComputeWorkGroupCount
+    // limits of the x, y and z axes.
+    for (uint i3 = gl_WorkGroupID.z; i3 < n_s; i3 += gl_NumWorkGroups.z) {
+    for (uint i2_base = gl_WorkGroupID.y * TOKENS_PER_WG; i2_base < n_t; i2_base += gl_NumWorkGroups.y * TOKENS_PER_WG) {
+    const uint i2 = i2_base + gl_LocalInvocationID.y;
+    if (i2 >= n_t) {
+        continue;
     }
+    for (uint i1 = gl_GlobalInvocationID.x; i1 < nr; i1 += gl_NumWorkGroups.x * gl_WorkGroupSize.x) {
 
     const uint src0_base = i3 * (nb02 / 4) + i2 + i1 * (nb01 / 4);
     const uint src1_base = i1 * (nb11 / 4);
@@ -57,4 +59,7 @@ void main() {
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
     dst[dst_idx] = sum;
+    }
+    }
+    }
 }

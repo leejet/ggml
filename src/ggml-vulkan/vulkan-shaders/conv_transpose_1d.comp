@@ -24,7 +24,7 @@ layout (push_constant) uniform parameter {
 } p;
 
 
-uint32_t Cout_idx = gl_WorkGroupID.x;
+uint32_t Cout_idx;
 const uint32_t bs = gl_WorkGroupSize.x;
 uint32_t tid = gl_LocalInvocationID.x;
 // Code is more straightforward if we assume it is bs*s0+K instead of (bs-1)*s0+K.
@@ -36,6 +36,9 @@ uint splitWork(uint workSize){
 }
 
 void main(){
+    // Grid-stride loop: Cout may exceed the maxComputeWorkGroupCount limit
+    // of the x axis. tmp is reused on every iteration, so a barrier is needed.
+    for (Cout_idx = gl_WorkGroupID.x; Cout_idx < p.Cout; Cout_idx += gl_NumWorkGroups.x) {
     for(uint32_t i = 0; i < splitWork(tmp_len); i++){
         uint32_t idx = i*bs+tid;
         if(idx < tmp_len){
@@ -94,5 +97,7 @@ void main(){
         if(KL_idx < p.KL){
             data_d[KL_idx + Cout_idx*p.nb1] = tmp[idx];
         }
+    }
+    barrier();
     }
 }

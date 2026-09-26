@@ -8482,6 +8482,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {3,2,2,1}, 1, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {3,1,2,1}, 1, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({2,1,1,1}, {3,1,1,1}, 1, 0, 1));
+    // Cout > 65535 exceeds maxComputeWorkGroupCount[0] on devices where it is the spec minimum
+    test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {2,70000,2,1}, 1, 0, 1));
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         // ConvTranspose1d expressed as mul_mat + col2im (DAC decoder upsampling)
@@ -9226,6 +9228,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {200000, 1, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {200000, 4, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {643251, 3, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+    // Large rows: exercises dispatch clamping/looping when nrows exceeds
+    // maxComputeWorkGroupCount (combined with GGML_VK_TEST_SM_LARGE for the
+    // large-column path).
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {1024, 66000, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {1024, 66000, 1, 1}, true,   true,  GGML_TYPE_F32, {1, 1}, 0.1f, 8.0f));
 
     for (float max_bias : {0.0f, 8.0f}) {
         for (float scale : {1.0f, 0.1f}) {
@@ -9455,6 +9462,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
+    // >65535 timesteps exceed maxComputeWorkGroupCount[1] on every backend
+    test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, { 70000, 1, 1, 1 }, 320, 10000));
     test_cases.emplace_back(new test_leaky_relu());
 
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 10, 5, 4, 3 }));

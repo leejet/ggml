@@ -36,10 +36,10 @@ void store_dst(uint32_t idx, float v) {
 }
 
 void main() {
-    const uint32_t t_out = gl_GlobalInvocationID.x;
-    const uint32_t oc    = gl_GlobalInvocationID.y;
-    if (t_out >= p.T_out || oc >= p.OC) return;
-
+    // Grid-stride loops: T_out/OC may exceed the maxComputeWorkGroupCount
+    // limits of the x and y axes.
+    for (uint32_t oc = gl_GlobalInvocationID.y; oc < p.OC; oc += gl_NumWorkGroups.y * gl_WorkGroupSize.y) {
+        for (uint32_t t_out = gl_GlobalInvocationID.x; t_out < p.T_out; t_out += gl_NumWorkGroups.x * gl_WorkGroupSize.x) {
     const int32_t t_abs = int32_t(t_out) + p.p0; // absolute position in uncropped signal
 
     // Gather: only the ceil(K/stride) columns that scatter into t_abs, no modulo
@@ -58,4 +58,6 @@ void main() {
 
     // dst layout: [T_out, OC], element (t_out, oc) = t_out + oc * T_out
     store_dst(t_out + oc * p.T_out, val);
+        }
+    }
 }

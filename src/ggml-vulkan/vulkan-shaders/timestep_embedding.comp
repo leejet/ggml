@@ -7,6 +7,7 @@ layout (push_constant) uniform parameter
     uint nb1;
     uint dim;
     uint max_period;
+    uint nrows;
 } p;
 
 #include "types.glsl"
@@ -20,23 +21,29 @@ layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
 void main() {
-    const uint i = gl_WorkGroupID.y;
-    const uint j = gl_GlobalInvocationID.x;
-    const uint d_offset = i * p.nb1;
-
     const uint half_dim = p.dim / 2;
 
-    if (p.dim % 2 != 0 && j == half_dim) {
-        data_d[d_offset + 2 * half_dim] = 0.f;
-    }
+    // Grid-stride loops: the number of timesteps (rows) and the embedding
+    // size may exceed the maxComputeWorkGroupCount limits of the x/y axes.
+    for (uint j = gl_GlobalInvocationID.x; j < (p.dim + 1) / 2; j += gl_NumWorkGroups.x * gl_WorkGroupSize.x) {
+    // The number of timesteps (rows) may exceed the maxComputeWorkGroupCount
+    // limit of the y axis; iterate over the remaining rows.
+    for (uint i = gl_WorkGroupID.y; i < p.nrows; i += gl_NumWorkGroups.y) {
+        const uint d_offset = i * p.nb1;
 
-    if (j >= half_dim) {
-        return;
-    }
+        if (p.dim % 2 != 0 && j == half_dim) {
+            data_d[d_offset + 2 * half_dim] = 0.f;
+        }
 
-    const float timestep = float(data_a[i]);
-    const float freq = float(exp(-log(p.max_period) * j / half_dim));
-    const float arg = timestep * freq;
-    data_d[d_offset + j] = D_TYPE(cos(arg));
-    data_d[d_offset + j + half_dim] = D_TYPE(sin(arg));
+        if (j >= half_dim) {
+            continue;
+        }
+
+        const float timestep = float(data_a[i]);
+        const float freq = float(exp(-log(p.max_period) * j / half_dim));
+        const float arg = timestep * freq;
+        data_d[d_offset + j] = D_TYPE(cos(arg));
+        data_d[d_offset + j + half_dim] = D_TYPE(sin(arg));
+    }
+    }
 }
