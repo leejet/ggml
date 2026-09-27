@@ -462,15 +462,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 const ggml_tensor * weight_scale = op->src[2];
                 const ggml_tensor * bias         = op->src[3];
                 const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
-                const ggml_tensor * packed_src   = src1->src[0];
-                const int64_t packed_rows = packed_src != nullptr ? GGML_PAD(ggml_nrows(packed_src), 4) : 0;
-                const int64_t packed_scale_rows = packed_src != nullptr
-                    ? (ggml_nrows(packed_src) * (int64_t)sizeof(float) + src0->ne[0] - 1) / src0->ne[0]
-                    : 0;
-                const bool packed_input          = src1->type == GGML_TYPE_I8 &&
-                                                   src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                                   packed_src != nullptr && src1->ne[0] == src0->ne[0] &&
-                                                   src1->ne[1] == packed_rows + packed_scale_rows;
+                const bool packed_input          = ggml_mul_mat_has_packed_i8_input(op);
                 return (src1->type == GGML_TYPE_F32 || packed_input) && op->type == GGML_TYPE_F32 &&
                        src0->ne[2] == 1 && src0->ne[3] == 1 &&
                        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
