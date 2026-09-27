@@ -1207,14 +1207,12 @@ static void ggml_compute_forward_mul_mat_i8_f32(
     const int64_t rows  = ggml_nrows(dst);
     const bool prequantized = src1->type == GGML_TYPE_I8;
     const int64_t rows_padded = GGML_PAD(rows, 4);
-    const int64_t scale_rows = (rows * (int64_t)sizeof(float) + k - 1) / k;
     const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
     const size_t qbytes = prequantized ? 0 : (size_t)ggml_nelements(src1) * sizeof(int8_t);
     const size_t scale_offset = GGML_PAD(qbytes, sizeof(float));
 
     GGML_ASSERT(src1->ne[0] == k);
-    GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                  src1->ne[1] == rows_padded + scale_rows));
+    GGML_ASSERT(!prequantized || ggml_mul_mat_has_packed_i8_input(dst));
     GGML_ASSERT(convrot_group_size == 0 || (convrot_group_size <= 256 && k % convrot_group_size == 0));
     GGML_ASSERT(prequantized || params->wsize >= scale_offset + (size_t)rows * sizeof(float));
 
@@ -1322,7 +1320,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     if (src0->type == GGML_TYPE_I8 &&
         (src1->type == GGML_TYPE_F32 ||
-         (src1->type == GGML_TYPE_I8 && src1->op == GGML_OP_QUANTIZE_I8_CONVROT))) {
+         ggml_mul_mat_has_packed_i8_input(dst))) {
         ggml_compute_forward_mul_mat_i8_f32(params, dst);
         return;
     }
@@ -1411,8 +1409,7 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    if (src0->type == GGML_TYPE_I8 && src1->type == GGML_TYPE_I8 &&
-        src1->op == GGML_OP_QUANTIZE_I8_CONVROT) {
+    if (ggml_mul_mat_has_packed_i8_input(dst)) {
         ggml_compute_forward_mul_mat_i8_f32(params, dst);
         return;
     }

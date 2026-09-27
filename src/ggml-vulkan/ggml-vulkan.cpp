@@ -7087,27 +7087,21 @@ static bool ggml_vk_can_use_mul_mat_i8_tensorwise(const vk_device & device, cons
     const ggml_tensor * input = dst->src[1];
     const ggml_tensor * weight_scale = dst->src[2];
     const ggml_tensor * bias = dst->src[3];
-    const ggml_tensor * logical_input = input != nullptr ? input->src[0] : nullptr;
     if (!device->integer_dot_product || weight == nullptr || input == nullptr ||
         weight->type != GGML_TYPE_I8 || input->type != GGML_TYPE_I8 ||
-        input->op != GGML_OP_QUANTIZE_I8_CONVROT || logical_input == nullptr ||
-        logical_input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_mul_mat_has_packed_i8_input(dst) || dst->type != GGML_TYPE_F32 ||
         weight_scale == nullptr ||
         weight->ne[2] != 1 || weight->ne[3] != 1 ||
         !ggml_is_contiguous(weight) || !ggml_is_contiguous(input) ||
-        !ggml_is_contiguous(logical_input) || !ggml_is_contiguous(weight_scale) ||
+        !ggml_is_contiguous(weight_scale) ||
         !ggml_is_contiguous(dst)) {
         return false;
     }
 
     const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
-    const int64_t rows = ggml_nrows(logical_input);
-    const int64_t rows_padded = GGML_PAD(rows, 4);
-    const int64_t scale_rows = (rows * (int64_t) sizeof(float) + weight->ne[0] - 1) / weight->ne[0];
-    return convrot_group_size == 256 && ggml_get_op_params_i32(input, 0) == 256 &&
-           weight->ne[0] % 256 == 0 &&
-           input->ne[0] == weight->ne[0] && input->ne[1] == rows_padded + scale_rows &&
-           ggml_nrows(dst) == rows && weight_scale->type == GGML_TYPE_F32 &&
+    const int64_t rows = ggml_nrows(dst);
+    return convrot_group_size == 256 && ggml_get_op_params_i32(dst, 4) == 256 &&
+           weight->ne[0] % 256 == 0 && weight_scale->type == GGML_TYPE_F32 &&
            ggml_nelements(weight_scale) == weight->ne[1] &&
            (bias == nullptr ||
             (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&

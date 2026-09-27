@@ -1718,12 +1718,10 @@ static void ggml_cuda_mul_mat_i8(
     const int64_t rows        = ggml_nrows(dst);
     const bool prequantized   = src1->type == GGML_TYPE_I8;
     const int64_t rows_padded = GGML_PAD(rows, 4);
-    const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + k - 1) / k;
     const int64_t qstride     = k;
     const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
     GGML_ASSERT(src1->ne[0] == k);
-    GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                  src1->ne[1] == rows_padded + scale_rows));
+    GGML_ASSERT(!prequantized || ggml_mul_mat_has_packed_i8_input(dst));
     GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 256);
 
     ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
@@ -1734,15 +1732,13 @@ static void ggml_cuda_mul_mat_i8(
         ? (float *)((int8_t *)src1->data + k * rows_padded)
         : scales.alloc(rows);
 
-    if (prequantized) {
-        GGML_ASSERT(src1->op == GGML_OP_QUANTIZE_I8_CONVROT);
-    } else if (convrot_group_size == 0) {
+    if (!prequantized && convrot_group_size == 0) {
         if (rows_padded > rows) {
             CUDA_CHECK(cudaMemsetAsync(qdata_d + k * rows, 0, (size_t)k * (rows_padded - rows), stream));
         }
         quantize_rowwise_i8_cuda<<<rows, 256, 0, stream>>>(
             (const float *)src1->data, qdata_d, scales_d, k, rows);
-    } else {
+    } else if (!prequantized) {
         ggml_cuda_quantize_i8_convrot(
             ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k);
     }
@@ -5854,15 +5850,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     const ggml_tensor * weight_scale = op->src[2];
                     const ggml_tensor * bias         = op->src[3];
                     const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
-                    const ggml_tensor * packed_src   = b->src[0];
-                    const int64_t packed_rows = packed_src != nullptr ? GGML_PAD(ggml_nrows(packed_src), 4) : 0;
-                    const int64_t packed_scale_rows = packed_src != nullptr
-                        ? (ggml_nrows(packed_src) * (int64_t)sizeof(float) + a->ne[0] - 1) / a->ne[0]
-                        : 0;
-                    const bool packed_input          = b->type == GGML_TYPE_I8 &&
-                                                       b->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                                       packed_src != nullptr && b->ne[0] == a->ne[0] &&
-                                                       b->ne[1] == packed_rows + packed_scale_rows;
+                    const bool packed_input          = ggml_mul_mat_has_packed_i8_input(op);
                     return op->op == GGML_OP_MUL_MAT && (b->type == GGML_TYPE_F32 || packed_input) &&
                            op->type == GGML_TYPE_F32 && a->ne[0] % 4 == 0 && a->ne[1] % 4 == 0 &&
                            a->ne[2] == 1 && a->ne[3] == 1 &&

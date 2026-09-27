@@ -3420,6 +3420,8 @@ GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
     result->src[2]              = weight_scale;
     result->src[3]              = bias;
     ggml_set_op_params_i32(result, 2, convrot_group_size);
+    // Scheduler copies preserve the packed data but not the producer's op or sources.
+    ggml_set_op_params_i32(result, 4, input->type == GGML_TYPE_I8 ? ggml_get_op_params_i32(input, 0) : 0);
     return result;
 }
 
