@@ -931,6 +931,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large2_f32, pipeline_soft_max_large2_f32_f16;
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
 
+    vk_pipeline pipeline_rope_apply_f32;
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;

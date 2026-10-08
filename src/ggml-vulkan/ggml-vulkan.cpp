@@ -3341,6 +3341,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large2_f32_f16, "soft_max_large2_f32_f16", soft_max_large2_f32_f16_len, soft_max_large2_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large3_f32_f16, "soft_max_large3_f32_f16", soft_max_large3_f32_f16_len, soft_max_large3_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
 
+    ggml_vk_create_pipeline(device, device->pipeline_rope_apply_f32, "rope_apply_f32", rope_apply_f32_len, rope_apply_f32_data, "main", 3, sizeof(vk_op_rope_apply_push_constants), {256, 1, 1}, {}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_rope_norm_f32, "rope_norm_f32", rope_norm_f32_len, rope_norm_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32, "rope_neox_f32", rope_neox_f32_len, rope_neox_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_multi_f32, "rope_multi_f32", rope_multi_f32_len, rope_multi_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
@@ -11129,6 +11131,34 @@ void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cg
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {logits_buf, bias_buf, weights_buf, ids_buf}, pc, elements);
 }
 
+static void ggml_vk_rope_apply(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    vk_pipeline pipeline = ctx->device->pipeline_rope_apply_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_rope_apply_push_constants pc {};
+    pc.half_dim = x->ne[0]/2;
+    pc.heads    = x->ne[1];
+    pc.tokens   = x->ne[2];
+    pc.pairs    = ggml_nelements(x)/2;
+    for (int i = 0; i < 4; ++i) {
+        pc.x_stride[i]  = x->nb[i]/sizeof(float);
+        pc.pe_stride[i] = pe->nb[i]/sizeof(float);
+    }
+    pc.x_offset    = get_misalign_bytes(ctx, x)/sizeof(float);
+    pc.pe_offset   = get_misalign_bytes(ctx, pe)/sizeof(float);
+    pc.dst_offset  = get_misalign_bytes(ctx, dst)/sizeof(float);
+    pc.interleaved = ggml_get_op_params_i32(dst, 0);
+
+    const uint32_t groups = CEIL_DIV(pc.pairs, 256);
+    const uint32_t groups_x = std::min(groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t groups_y = CEIL_DIV(groups, groups_x);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, pe, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { groups_x*256, groups_y, 1 });
+}
+
 void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, bool backprop) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -12495,6 +12525,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_SOFT_MAX_BACK:
         ggml_vk_soft_max_back(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    case GGML_OP_ROPE_APPLY:
+        ggml_vk_rope_apply(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_ROPE:
@@ -15579,6 +15613,23 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                   (ggml_type_size(op->type) == sizeof(float) || ggml_type_size(op->type) == 2);
         case GGML_OP_REPEAT_BACK:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_ROPE_APPLY:
+            if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+                op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            // The shader uses 32-bit element indices, including descriptor alignment offsets.
+            for (const ggml_tensor * tensor : std::array<const ggml_tensor *, 3>{ op, op->src[0], op->src[1] }) {
+                if (ggml_nbytes(tensor) > UINT32_MAX) {
+                    return false;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    if (tensor->nb[i] > UINT32_MAX || tensor->nb[i] % sizeof(float) != 0) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         case GGML_OP_ROPE:
             return ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_ROPE_BACK:

@@ -5987,6 +5987,48 @@ void ggml_compute_forward_clamp(
     }
 }
 
+// ggml_compute_forward_rope_apply
+
+void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const bool interleaved = ggml_get_op_params_i32(dst, 0) != 0;
+    const int64_t half_dim = x->ne[0]/2;
+    const int64_t rows = x->ne[1]*x->ne[2]*x->ne[3];
+    const int64_t rows_per_thread = (rows + params->nth - 1)/params->nth;
+    const int64_t begin = rows_per_thread*params->ith;
+    const int64_t end = std::min(begin + rows_per_thread, rows);
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t token = row % x->ne[2];
+        const int64_t head  = (row / x->ne[2]) % x->ne[1];
+        const int64_t batch = row / (x->ne[2]*x->ne[1]);
+        const char * x_row = (const char *) x->data + head*x->nb[1] + token*x->nb[2] + batch*x->nb[3];
+        const char * pe_row = (const char *) pe->data + token*pe->nb[3];
+        float * out = (float *) dst->data + row*x->ne[0];
+        for (int64_t j = 0; j < half_dim; ++j) {
+            const int64_t i0 = interleaved ? 2*j : j;
+            const int64_t i1 = interleaved ? 2*j + 1 : j + half_dim;
+            const float a = *(const float *) (x_row + i0*x->nb[0]);
+            const float b = *(const float *) (x_row + i1*x->nb[0]);
+            const char * matrix = pe_row + j*pe->nb[2];
+            const float c = *(const float *) matrix;
+            const float s = *(const float *) (matrix + pe->nb[1]);
+            if (interleaved) {
+                const float neg_s = *(const float *) (matrix + pe->nb[0]);
+                const float c1 = *(const float *) (matrix + pe->nb[0] + pe->nb[1]);
+                out[i0] = a*c + b*neg_s;
+                out[i1] = a*s + b*c1;
+            } else {
+                out[i0] = a*c - b*s;
+                out[i1] = a*s + b*c;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_rope
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {

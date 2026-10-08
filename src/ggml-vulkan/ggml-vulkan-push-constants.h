@@ -452,6 +452,21 @@ struct vk_op_diag_mask_push_constants {
     int32_t n_past;
 };
 
+struct vk_op_rope_apply_push_constants {
+    uint32_t half_dim;
+    uint32_t heads;
+    uint32_t tokens;
+    uint32_t pairs;
+    uint32_t x_stride[4];
+    uint32_t pe_stride[4];
+    uint32_t x_offset;
+    uint32_t pe_offset;
+    uint32_t dst_offset;
+    uint32_t interleaved;
+};
+
+static_assert(sizeof(vk_op_rope_apply_push_constants) == 64, "rope_apply push constant layout mismatch");
+
 struct vk_op_rope_push_constants {
     uint32_t rope_mode;
     uint32_t nrows;

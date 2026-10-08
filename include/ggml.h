@@ -606,6 +606,7 @@ extern "C" {
         GGML_OP_QUANTIZE_I8_CONVROT,
         GGML_OP_SAGE_ATTN,
         GGML_OP_SOL_ATTN,
+        GGML_OP_ROPE_APPLY,
 
         GGML_OP_COUNT,
     };
@@ -1862,6 +1863,17 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 scale,
             float                 max_bias);
+
+    // Apply precomputed rotary matrices, with shapes in ne[] order:
+    // a: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, head_dim/2, tokens].
+    // pe stores [[cos, -sin], [sin, cos]] for each pair and token, shared across heads/batches.
+    // Returns contiguous F32 [head_dim, tokens, heads*batch]. Input strides are preserved.
+    // Interleaved pairs are (2*i, 2*i+1); otherwise pairs are (i, i+head_dim/2).
+    GGML_API struct ggml_tensor * ggml_rope_apply(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe,
+            bool                  interleaved);
 
     // rotary position embedding
     // if (mode & 1) - skip n_past elements (NOT SUPPORTED)

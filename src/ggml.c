@@ -1117,9 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QUANTIZE_I8_CONVROT",
     "SAGE_ATTN",
     "SOL_ATTN",
+    "ROPE_APPLY",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1236,9 +1237,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "quantize_i8_convrot(x)",
     "sage_attn(x,y,z)",
     "sol_attn(x,y,z)",
+    "rope_apply(x,pe)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4353,6 +4355,26 @@ struct ggml_tensor * ggml_soft_max_ext_back_inplace(
         float                 scale,
         float                 max_bias) {
     return ggml_soft_max_ext_back_impl(ctx, a, b, scale, max_bias, true);
+}
+
+// ggml_rope_apply
+
+struct ggml_tensor * ggml_rope_apply(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe,
+        bool                  interleaved) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
+    GGML_ASSERT(pe->ne[2] == a->ne[0]/2 && pe->ne[3] == a->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1]*a->ne[3]);
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+    result->op     = GGML_OP_ROPE_APPLY;
+    result->src[0] = a;
+    result->src[1] = pe;
+    return result;
 }
 
 // ggml_rope
