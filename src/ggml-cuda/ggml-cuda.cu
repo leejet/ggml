@@ -1742,6 +1742,10 @@ static void ggml_cuda_mul_mat_i8(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_i8_blas_available(cc)) {
+        GGML_ABORT("INT8 mul_mat (convrot) not supported on this arch (cc %d)", cc);
+    }
     GGML_ASSERT(src0->type == GGML_TYPE_I8);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I8);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -6149,8 +6153,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
                              ggml_nelements(bias) == a->ne[1])) &&
                            (convrot_group_size == 0 || (convrot_group_size == 256 && a->ne[0] % 256 == 0)) &&
-                           (turing_mma_available(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
-                            GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+                           ggml_cuda_i8_blas_available(cc);
 #else
                     return false;
 #endif
