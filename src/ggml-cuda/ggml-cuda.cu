@@ -89,6 +89,10 @@
 #include <memory>
 #include <mutex>
 #include <cstdarg>
+#if defined(GGML_USE_HIP) && defined(GGML_HIPBLASLT)
+#include <hipblaslt/hipblaslt.h>
+#include <cstdlib>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -1737,6 +1741,84 @@ static bool ggml_cuda_op_quantize_i8_convrot(
     return true;
 }
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIPBLASLT)
+static bool ggml_cuda_mul_mat_i8_hipblaslt(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const int8_t * qdata_d,
+        int32_t * accum,
+        int64_t n,
+        int64_t rows_padded,
+        int64_t k) {
+    const char * disabled = std::getenv("GGML_HIPBLASLT_DISABLE_I8");
+    if (disabled != nullptr && strcmp(disabled, "1") == 0) {
+        return false;
+    }
+
+    hipblasLtHandle_t handle = nullptr;
+    hipblasLtMatmulDesc_t op_desc = nullptr;
+    hipblasLtMatrixLayout_t a_desc = nullptr;
+    hipblasLtMatrixLayout_t b_desc = nullptr;
+    hipblasLtMatrixLayout_t c_desc = nullptr;
+    hipblasLtMatrixLayout_t d_desc = nullptr;
+    hipblasLtMatmulPreference_t preference = nullptr;
+    bool ok = false;
+
+    auto cleanup = [&]() {
+        if (preference) hipblasLtMatmulPreferenceDestroy(preference);
+        if (d_desc) hipblasLtMatrixLayoutDestroy(d_desc);
+        if (c_desc) hipblasLtMatrixLayoutDestroy(c_desc);
+        if (b_desc) hipblasLtMatrixLayoutDestroy(b_desc);
+        if (a_desc) hipblasLtMatrixLayoutDestroy(a_desc);
+        if (op_desc) hipblasLtMatmulDescDestroy(op_desc);
+        if (handle) hipblasLtDestroy(handle);
+    };
+
+    if (hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescCreate(&op_desc, HIPBLAS_COMPUTE_32I, HIP_R_32I) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_8I, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_8I, k, rows_padded, k) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&c_desc, HIP_R_32I, n, rows_padded, n) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&d_desc, HIP_R_32I, n, rows_padded, n) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulPreferenceCreate(&preference) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    hipblasOperation_t trans_a = HIPBLAS_OP_T;
+    hipblasOperation_t trans_b = HIPBLAS_OP_N;
+    if (hipblasLtMatmulDescSetAttribute(op_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(op_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    uint64_t workspace_size = 0;
+    if (hipblasLtMatmulPreferenceSetAttribute(preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &workspace_size, sizeof(workspace_size)) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    hipblasLtMatmulHeuristicResult_t heuristic = {};
+    int returned = 0;
+    if (hipblasLtMatmulAlgoGetHeuristic(handle, op_desc, a_desc, b_desc, c_desc, d_desc,
+                                        preference, 1, &heuristic, &returned) != HIPBLAS_STATUS_SUCCESS ||
+        returned == 0 || heuristic.state != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    ok = hipblasLtMatmul(handle, op_desc, &alpha, src0->data, a_desc, qdata_d, b_desc,
+                         &beta, accum, c_desc, accum, d_desc, &heuristic.algo,
+                         nullptr, 0, ctx.stream()) == HIPBLAS_STATUS_SUCCESS;
+    cleanup();
+    return ok;
+}
+#endif
+
 static void ggml_cuda_mul_mat_i8(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -1788,15 +1870,21 @@ static void ggml_cuda_mul_mat_i8(
     const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
     ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
 
-    const int32_t alpha = 1;
-    const int32_t beta  = 0;
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-    CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-        (int)n, (int)rows_padded, (int)k,
-        &alpha, src0->data, CUDA_R_8I, (int)k,
-                qdata_d, CUDA_R_8I, (int)qstride,
-        &beta,  accum.get(), CUDA_R_32I, (int)n,
-        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    bool direct_ok = false;
+#if defined(GGML_USE_HIP) && defined(GGML_HIPBLASLT)
+    direct_ok = ggml_cuda_mul_mat_i8_hipblaslt(ctx, src0, qdata_d, accum.get(), n, rows_padded, k);
+#endif
+    if (!direct_ok) {
+        const int32_t alpha = 1;
+        const int32_t beta  = 0;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)n, (int)rows_padded, (int)k,
+            &alpha, src0->data, CUDA_R_8I, (int)k,
+                    qdata_d, CUDA_R_8I, (int)qstride,
+            &beta,  accum.get(), CUDA_R_32I, (int)n,
+            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
 
     const dim3 dequant_grid((n + 255) / 256, rows, 1);
     dequantize_i32_rows_cuda<<<dequant_grid, 256, 0, stream>>>(

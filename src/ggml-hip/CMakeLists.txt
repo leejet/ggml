@@ -78,6 +78,12 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+find_package(hipblaslt CONFIG QUIET)
+if (hipblaslt_FOUND AND TARGET roc::hipblaslt)
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIPBLASLT)
+    target_link_libraries(ggml-hip PRIVATE roc::hipblaslt)
+endif()
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
