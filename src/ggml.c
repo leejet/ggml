@@ -685,6 +685,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+    },
+    [GGML_TYPE_F8_E5M2] = {
+        .type_name                = "f8_e5m2",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e5m2,
+    },
     [GGML_TYPE_Q1_0] = {
         .type_name                = "q1_0",
         .blck_size                = QK1_0,
@@ -1110,9 +1124,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "QUANTIZE_I8_CONVROT",
+    "SAGE_ATTN",
+    "SOL_ATTN",
+    "ROPE_APPLY",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1244,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "quantize_i8_convrot(x)",
+    "sage_attn(x,y,z)",
+    "sol_attn(x,y,z)",
+    "rope_apply(x,pe)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3376,6 +3400,54 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
+GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * weight_scale,
+        struct ggml_tensor  * bias,
+        int                   convrot_group_size) {
+    GGML_ASSERT(weight->type == GGML_TYPE_I8);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_I8);
+    GGML_ASSERT(weight_scale != NULL && weight_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight_scale));
+    GGML_ASSERT(ggml_nelements(weight_scale) == weight->ne[1]);
+    GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
+    GGML_ASSERT(bias == NULL || ggml_nelements(bias) == weight->ne[1]);
+    GGML_ASSERT(convrot_group_size == 0 || weight->ne[0] % convrot_group_size == 0);
+
+    int n = convrot_group_size;
+    while (n > 1 && n % 4 == 0) {
+        n /= 4;
+    }
+    GGML_ASSERT(n == 0 || n == 1);
+
+    const struct ggml_tensor * logical_input = input;
+    if (input->type == GGML_TYPE_I8) {
+        GGML_ASSERT(input->op == GGML_OP_QUANTIZE_I8_CONVROT);
+        GGML_ASSERT(input->src[0] != NULL);
+        logical_input = input->src[0];
+        const int64_t rows_padded = GGML_PAD(ggml_nrows(logical_input), 4);
+        const int64_t scale_rows  = (ggml_nrows(logical_input) * (int64_t)sizeof(float) + weight->ne[0] - 1) /
+                                    weight->ne[0];
+        GGML_ASSERT(input->ne[0] == weight->ne[0]);
+        GGML_ASSERT(input->ne[1] == rows_padded + scale_rows);
+    }
+    GGML_ASSERT(ggml_can_mul_mat(weight, logical_input));
+
+    const int64_t ne[4] = { weight->ne[1], logical_input->ne[1], logical_input->ne[2], logical_input->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op                  = GGML_OP_MUL_MAT;
+    result->src[0]              = weight;
+    result->src[1]              = input;
+    result->src[2]              = weight_scale;
+    result->src[3]              = bias;
+    ggml_set_op_params_i32(result, 2, convrot_group_size);
+    // Scheduler copies preserve the packed data but not the producer's op or sources.
+    ggml_set_op_params_i32(result, 4, input->type == GGML_TYPE_I8 ? ggml_get_op_params_i32(input, 0) : 0);
+    return result;
+}
+
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -3394,6 +3466,30 @@ void ggml_mul_mat_set_hint(
     const int32_t hint_i32 = (int32_t) hint;
 
     ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
+struct ggml_tensor * ggml_quantize_i8_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   group_size) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(group_size > 0 && a->ne[0] % group_size == 0);
+
+    int n = group_size;
+    while (n > 1 && n % 4 == 0) {
+        n /= 4;
+    }
+    GGML_ASSERT(n == 1);
+
+    const int64_t rows_padded = GGML_PAD(ggml_nrows(a), 4);
+    const int64_t scale_rows  = (ggml_nrows(a) * (int64_t)sizeof(float) + a->ne[0] - 1) / a->ne[0];
+    const int64_t ne[2]       = { a->ne[0], rows_padded + scale_rows };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I8, 2, ne);
+    result->op                  = GGML_OP_QUANTIZE_I8_CONVROT;
+    result->src[0]              = a;
+    ggml_set_op_params_i32(result, 0, group_size);
+    return result;
 }
 
 // ggml_mul_mat_id
@@ -4280,6 +4376,26 @@ struct ggml_tensor * ggml_soft_max_ext_back_inplace(
         float                 scale,
         float                 max_bias) {
     return ggml_soft_max_ext_back_impl(ctx, a, b, scale, max_bias, true);
+}
+
+// ggml_rope_apply
+
+struct ggml_tensor * ggml_rope_apply(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe,
+        bool                  interleaved) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
+    GGML_ASSERT(pe->ne[2] == a->ne[0]/2 && pe->ne[3] == a->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1]*a->ne[3]);
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+    result->op     = GGML_OP_ROPE_APPLY;
+    result->src[0] = a;
+    result->src[1] = pe;
+    return result;
 }
 
 // ggml_rope
@@ -5560,6 +5676,50 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+
+struct ggml_tensor * ggml_sage_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        float                 scale,
+        enum ggml_sage_attn_mode mode) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v));
+    GGML_ASSERT(q->ne[0] == k->ne[0] && ggml_are_same_shape(k, v));
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0 && q->ne[3] == k->ne[3]);
+    GGML_ASSERT(isfinite(scale) && scale > 0.0f);
+    GGML_ASSERT(mode >= GGML_SAGE_ATTN_AUTO && mode <= GGML_SAGE_ATTN_2_PLUS_PLUS);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[2], q->ne[1], q->ne[3]);
+    result->op = GGML_OP_SAGE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    ggml_set_op_params(result, &scale, sizeof(scale));
+    ggml_set_op_params_i32(result, 1, mode);
+    return result;
+}
+
+struct ggml_tensor* ggml_sol_attn(
+    struct ggml_context* ctx,
+    struct ggml_tensor* q,
+    struct ggml_tensor* k,
+    struct ggml_tensor* v,
+    float scale,
+    float tau) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v));
+    GGML_ASSERT(q->ne[0] == 128 && q->ne[1] > 0 && ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v));
+    GGML_ASSERT(isfinite(scale) && scale > 0.0f && isfinite(tau));
+    struct ggml_tensor* result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[2], q->ne[1], q->ne[3]);
+    result->op                 = GGML_OP_SOL_ATTN;
+    result->src[0]             = q;
+    result->src[1]             = k;
+    result->src[2]             = v;
+    const float params[]       = {scale, tau};
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,

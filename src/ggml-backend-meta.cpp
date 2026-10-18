@@ -153,6 +153,9 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (op->op == GGML_OP_SAGE_ATTN || op->op == GGML_OP_SOL_ATTN) {
+        return false;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
@@ -1066,6 +1069,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_OPT_STEP_SGD:
             case GGML_OP_GLU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_QUANTIZE_I8_CONVROT: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));

@@ -868,6 +868,10 @@ void process_shaders() {
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("cpy_16", "copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_f16_f32", "copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
+    string_to_spv("cpy_f8_e4m3_f16", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_F8_E4M3", "1"}});
+    string_to_spv("cpy_f8_e5m2_f16", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_F8_E5M2", "1"}});
+    string_to_spv("cpy_f8_e4m3_bf16", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_F8_E4M3", "1"}, {"DATA_D_BF16", "1"}});
+    string_to_spv("cpy_f8_e5m2_bf16", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_F8_E5M2", "1"}, {"DATA_D_BF16", "1"}});
     string_to_spv("cpy_f32_bf16","copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
     string_to_spv("cpy_bf16_f32","copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
     string_to_spv("cpy_bf16_f16","copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_BF16", "1"}});
@@ -877,6 +881,10 @@ void process_shaders() {
     string_to_spv("contig_cpy_f32_f16", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("contig_cpy_16", "contig_copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("contig_cpy_f16_f32", "contig_copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
+    string_to_spv("contig_cpy_f8_e4m3_f16", "contig_copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_F8_E4M3", "1"}});
+    string_to_spv("contig_cpy_f8_e5m2_f16", "contig_copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_F8_E5M2", "1"}});
+    string_to_spv("contig_cpy_f8_e4m3_bf16", "contig_copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_F8_E4M3", "1"}, {"DATA_D_BF16", "1"}});
+    string_to_spv("contig_cpy_f8_e5m2_bf16", "contig_copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_F8_E5M2", "1"}, {"DATA_D_BF16", "1"}});
     string_to_spv("contig_cpy_f32_bf16","contig_copy.comp",{{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
     string_to_spv("contig_cpy_bf16_f32","contig_copy.comp",{{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
     string_to_spv("contig_cpy_bf16_f16","contig_copy.comp",{{"A_TYPE", "uint16_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_BF16", "1"}});
@@ -945,6 +953,14 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("quantize_i8_convrot", "quantize_i8_convrot.comp", {});
+    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm1.comp", {}, true, true);
+#endif
+#endif
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -1079,6 +1095,8 @@ void process_shaders() {
     string_to_spv("soft_max_large1_f32_f16", "soft_max_large1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_large2_f32_f16", "soft_max_large2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_large3_f32_f16", "soft_max_large3.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
+
+    string_to_spv("rope_apply_f32", "rope_apply.comp", {});
 
     string_to_spv("rope_norm_f32", "rope_norm.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
     string_to_spv("rope_norm_f16", "rope_norm.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});

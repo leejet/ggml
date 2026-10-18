@@ -787,6 +787,9 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_i8_convrot;
+    vk_pipeline pipeline_mul_mat_i8_tensorwise;
+    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -835,8 +838,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
-    vk_pipeline pipeline_cpy_32, pipeline_cpy_f32_f16, pipeline_cpy_16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_bf16_f32, pipeline_cpy_bf16_f16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
-    vk_pipeline pipeline_contig_cpy_32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_bf16_f16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
+    vk_pipeline pipeline_cpy_32, pipeline_cpy_f32_f16, pipeline_cpy_16, pipeline_cpy_f16_f32, pipeline_cpy_f8_e4m3_f16, pipeline_cpy_f8_e5m2_f16, pipeline_cpy_f8_e4m3_bf16, pipeline_cpy_f8_e5m2_bf16, pipeline_cpy_f32_bf16, pipeline_cpy_bf16_f32, pipeline_cpy_bf16_f16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
+    vk_pipeline pipeline_contig_cpy_32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f8_e4m3_f16, pipeline_contig_cpy_f8_e5m2_f16, pipeline_contig_cpy_f8_e4m3_bf16, pipeline_contig_cpy_f8_e5m2_bf16, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_bf16_f16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
@@ -920,6 +923,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large2_f32, pipeline_soft_max_large2_f32_f16;
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
 
+    vk_pipeline pipeline_rope_apply_f32;
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
