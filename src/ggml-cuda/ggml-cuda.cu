@@ -1755,6 +1755,12 @@ static bool ggml_cuda_mul_mat_i8_hipblaslt(
         return false;
     }
 
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(ctx.stream(), &capture_status) != hipSuccess ||
+        capture_status != hipStreamCaptureStatusNone) {
+        return false;
+    }
+
     hipblasLtHandle_t handle = nullptr;
     hipblasLtMatmulDesc_t op_desc = nullptr;
     hipblasLtMatrixLayout_t a_desc = nullptr;
@@ -1774,8 +1780,11 @@ static bool ggml_cuda_mul_mat_i8_hipblaslt(
         if (handle) hipblasLtDestroy(handle);
     };
 
-    if (hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasLtMatmulDescCreate(&op_desc, HIPBLAS_COMPUTE_32I, HIP_R_32I) != HIPBLAS_STATUS_SUCCESS ||
+    if (hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+    if (hipblasLtMatmulDescCreate(&op_desc, HIPBLAS_COMPUTE_32I, HIP_R_32I) != HIPBLAS_STATUS_SUCCESS ||
         hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_8I, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
         hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_8I, k, rows_padded, k) != HIPBLAS_STATUS_SUCCESS ||
         hipblasLtMatrixLayoutCreate(&c_desc, HIP_R_32I, n, rows_padded, n) != HIPBLAS_STATUS_SUCCESS ||
