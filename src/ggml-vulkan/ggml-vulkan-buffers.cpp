@@ -47,8 +47,30 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
     return indices;
 }
 
+static uint32_t ggml_vk_device_memory_type_bits(const vk::PhysicalDeviceMemoryProperties & mem_props) {
+    vk::DeviceSize main_heap_size = 0;
+    for (uint32_t i = 0; i < mem_props.memoryHeapCount; ++i) {
+        if (mem_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            main_heap_size = std::max(main_heap_size, mem_props.memoryHeaps[i].size);
+        }
+    }
+
+    uint32_t memory_type_bits = UINT32_MAX;
+    const auto host_visible_vidmem = vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+        const auto & type = mem_props.memoryTypes[i];
+        if ((type.propertyFlags & host_visible_vidmem) == host_visible_vidmem &&
+            mem_props.memoryHeaps[type.heapIndex].size < main_heap_size) {
+            // A small BAR window is not a suitable heap for bulk device buffers.
+            // Exclude it from fallback searches too: DEVICE_LOCAL also matches HOST_VISIBLE types.
+            memory_type_bits &= ~(uint32_t(1) << i);
+        }
+    }
+    return memory_type_bits;
+}
+
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, bool device_buffer = false) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -88,6 +110,9 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
 
     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    if (device_buffer && !device->uma && !device->prefer_host_memory) {
+        mem_req.memoryTypeBits &= ggml_vk_device_memory_type_bits(mem_props);
+    }
 
     const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
 
@@ -219,29 +244,29 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     try {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
+                                                       vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, true);
         } else if (device->uma) {
             // On UMA, prefer host-visible memory so direct tensor borrowing works.
             // If unavailable, fall back to device-local memory.
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, true);
         } else if (device->disable_host_visible_vidmem) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, true);
             } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, true);
             }
         } else {
             // use rebar if available, otherwise fallback to device only visible memory
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                            vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, true);
             } else {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, true);
             }
         }
     } catch (const vk::SystemError& e) {
