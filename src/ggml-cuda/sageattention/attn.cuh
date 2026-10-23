@@ -47,6 +47,8 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
                       float sm_scale)
 {
+  // Older CUDA headers omit BF16 intrinsics in pre-Ampere device passes.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
@@ -663,6 +665,9 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   }
 
   // }
+#else
+  RUNTIME_ASSERT("SageAttention requires SM80 or newer");
+#endif
 }
 
 

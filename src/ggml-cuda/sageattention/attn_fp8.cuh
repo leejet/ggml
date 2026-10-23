@@ -47,6 +47,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
                       float sm_scale)
 {
+  // Keep unsupported device passes from parsing architecture-specific intrinsics.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
@@ -696,6 +698,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k]);
     }
   }
+#else
+  RUNTIME_ASSERT("FP8 SageAttention requires SM89 or newer");
+#endif
 }
 
 #undef PACK_SIZE_QK
