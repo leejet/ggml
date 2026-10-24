@@ -26,6 +26,9 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+void quantize_moss_norm_mmq_q8_1_cuda(const ggml_tensor* add, void* output, int64_t padded, cudaStream_t stream, const ggml_tensor* residual_mul = nullptr);
+void quantize_situ_mmq_q8_1_cuda(const ggml_tensor* activation, void* output, int64_t padded, cudaStream_t stream);
+
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,

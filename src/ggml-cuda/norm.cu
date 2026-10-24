@@ -356,6 +356,46 @@ static void rms_norm_f32_cuda(
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void rms_norm_mul_128_warp(
+    const float* x,
+    const float* weight,
+    float* dst,
+    int nrows,
+    int nchannels,
+    int total_rows,
+    int64_t stride_row,
+    int64_t stride_channel,
+    int64_t stride_sample,
+    float eps) {
+    ggml_cuda_pdl_lc();
+    const int flat = blockIdx.x * 4 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (flat >= total_rows) {
+        return;
+    }
+    const int row     = flat % nrows;
+    const int channel = flat / nrows % nchannels;
+    const int sample  = flat / nrows / nchannels;
+    ggml_cuda_pdl_sync();
+    const float* input = x + sample * stride_sample + channel * stride_channel + row * stride_row;
+    float values[4], sums[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] = input[lane + i * 32];
+        sums[i]   = warp_reduce_sum(__fmul_rn(values[i], values[i]));
+    }
+    // Reproduce the original four nonzero warp sums without its inter-warp barrier.
+    const float sum   = __fadd_rn(__fadd_rn(sums[0], sums[2]), __fadd_rn(sums[1], sums[3]));
+    const float scale = rsqrtf(sum / 128 + eps);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int col                  = lane + i * 32;
+        dst[int64_t(flat) * 128 + col] = __fmul_rn(__fmul_rn(scale, values[i]), weight[col]);
+    }
+}
+#endif
+
 static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float *  mul,
                                   const float *  add,
@@ -389,6 +429,18 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         return;
     }
     if (add == nullptr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const int64_t total_rows = int64_t(nrows) * nchannels * nsamples;
+        if (ncols == 128 && mul_ncols == 128 && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+            total_rows > 0 && total_rows <= INT_MAX &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_AMPERE_GA10X) {
+            const ggml_cuda_kernel_launch_params launch_params = {
+                dim3((total_rows + 3) / 4), dim3(128), 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_mul_128_warp, launch_params, x, mul, dst, nrows, nchannels, int(total_rows),
+                                    stride_row, stride_channel, stride_sample, eps);
+            return;
+        }
+#endif
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);

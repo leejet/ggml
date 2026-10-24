@@ -402,6 +402,44 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
 }
 
+static __global__ void situ_f32(const float* gate, const float* up, float* dst, int64_t count, int64_t columns, int64_t gate_stride, int64_t up_stride) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    const int64_t row = i / columns;
+    const int64_t col = i % columns;
+    ggml_cuda_pdl_sync();
+    const float g = gate[row * gate_stride + col];
+    const float h = up[row * up_stride + col];
+    // Preserve the separate softcap, sigmoid and multiply rounding of the original graph.
+    const float a = __fmul_rn(tanhf(__fmul_rn(0.25f, g)), 4.0f);
+    const float b = __fmul_rn(tanhf(__fmul_rn(1.0f / 25.0f, h)), 25.0f);
+    dst[i]        = __fmul_rn(__fmul_rn(a, op_sigmoid(g)), b);
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor* src0 = dst->src[0];
+    const ggml_tensor* src1 = dst->src[1];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(src1 == nullptr || (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1)));
+    const int64_t columns = dst->ne[0];
+    const bool swapped    = ggml_get_op_params_i32(dst, 1) != 0;
+    const float* gate     = static_cast<const float*>(src0->data);
+    const float* up       = static_cast<const float*>(src1 ? src1->data : src0->data);
+    if (src1 == nullptr) {
+        gate += swapped ? columns : 0;
+        up += swapped ? 0 : columns;
+    }
+    const int64_t count = ggml_nelements(dst);
+    const dim3 blocks((count + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()};
+    ggml_cuda_kernel_launch(situ_f32, launch_params, gate, up, static_cast<float*>(dst->data),
+                            count, columns, src0->nb[1] / sizeof(float), (src1 ? src1->nb[1] : src0->nb[1]) / sizeof(float));
+}
+
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_gelu_erf>(ctx, dst);
 }

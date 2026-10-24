@@ -638,6 +638,9 @@ extern "C" {
         GGML_UNARY_OP_COUNT,
     };
 
+    // The operation is available at compile time; backend support is checked at runtime.
+#define GGML_HAS_SITU 1
+
     enum ggml_glu_op {
         GGML_GLU_OP_REGLU,
         GGML_GLU_OP_GEGLU,
@@ -646,6 +649,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
