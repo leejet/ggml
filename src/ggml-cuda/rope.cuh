@@ -4,6 +4,8 @@
 
 void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_rms_norm_mul_rope_apply(ggml_backend_cuda_context& ctx, ggml_tensor* norm, ggml_tensor* mul, ggml_tensor* rope, ggml_tensor* dst);
+
 void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

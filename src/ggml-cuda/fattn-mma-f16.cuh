@@ -60,6 +60,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 2,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 256, 512, 1, 64, 64, 64, 64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 4,  32,  96,  64,  64, 2, true);
@@ -363,13 +364,15 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ,
 // ------------------------------------------------------------------------------------------------------------------
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
-    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
+    const bool wide_self_attention = DKQ == 128 && DV == 128 && ncols1 == 256 && ncols2 == 1;
+    return cp_async_available(cc) && (ncols2 >= 2 || wide_self_attention) ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1 * ncols2, cc) : 0;
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
 #ifdef CP_ASYNC_AVAILABLE
-    const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
+    const bool wide_self_attention = DKQ == 128 && DV == 128 && ncols1 == 256 && ncols2 == 1;
+    const int nstages_target       = ncols2 >= 2 || wide_self_attention ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1 * ncols2) : 0;
     // sparse gather is not implemented for multi-stage loading
     return use_sparse && nstages_target > 1 ? 1 : nstages_target;
 #else
@@ -571,36 +574,35 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
-    bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
-    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
+template <int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check, typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
 static __device__ __forceinline__ void flash_attn_ext_f16_iter(
-        const float2 * const __restrict__ Q_f2,
-        const half2  * const __restrict__ K_h2,
-        const half2  * const __restrict__ V_h2,
-        const half   * const __restrict__ mask_h,
-        const int32_t * const __restrict__ indices,
-        float2       * const __restrict__ dstk,
-        float2       * const __restrict__ dstk_fixup,
-        const float scale,
-        const float slope,
-        const float logit_softcap,
-        const uint3 ne01,
-        const int ne02,
-        const int stride_K,
-        const int stride_V,
-        const int stride_mask,
-        half2        * const __restrict__ tile_Q,
-        half2        * const __restrict__ tile_K,
-        half2        * const __restrict__ tile_V,
-        half         * const __restrict__ tile_mask,
-        T_B_KQ       * const __restrict__ Q_B,
-        T_C_VKQ      * const __restrict__ VKQ_C,
-        float        * const __restrict__ KQ_max,
-        float        * const __restrict__ KQ_rowsum,
-        const int jt,
-        const int kb0,
-        const int k_VKQ_sup) {
+    const float2* const __restrict__ Q_f2,
+    const half2* const __restrict__ K_h2,
+    const half2* const __restrict__ V_h2,
+    const half* const __restrict__ mask_h,
+    const int32_t* const __restrict__ indices,
+    float2* const __restrict__ dstk,
+    float2* const __restrict__ dstk_fixup,
+    const float scale,
+    const float slope,
+    const float logit_softcap,
+    const uint3 ne01,
+    const int ne02,
+    const int ne11,
+    const int stride_K,
+    const int stride_V,
+    const int stride_mask,
+    half2* const __restrict__ tile_Q,
+    half2* const __restrict__ tile_K,
+    half2* const __restrict__ tile_V,
+    half* const __restrict__ tile_mask,
+    T_B_KQ* const __restrict__ Q_B,
+    T_C_VKQ* const __restrict__ VKQ_C,
+    float* const __restrict__ KQ_max,
+    float* const __restrict__ KQ_rowsum,
+    const int jt,
+    const int kb0,
+    const int k_VKQ_sup) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -627,14 +629,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(TURING_MMA_AVAILABLE)
 
     if constexpr (nstages > 1) {
-        static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
+        static_assert(!oob_check || (last_iter && ncols2 == 1), "OOB check only supported for the self-attention tail");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi stage loading");
-        constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr);
+        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, !oob_check, oob_check, use_sparse>(V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr);
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
@@ -982,16 +982,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
         // Preload K tile for next iteration:
-        constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        if (!last_iter) {
+        if constexpr (!last_iter) {
             if (ncols2 > 1 || mask_h) {
-                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, oob_check, use_sparse>(mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt * ncols1, ne01, nullptr);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
+            if constexpr (ncols2 == 1) {
+                const int next_sup = min(nbatch_fa, ne11 - k_VKQ_0 - nbatch_fa);
+                if (next_sup < nbatch_fa) {
+                    // The asynchronous loader requires a complete tile; zero-fill the final partial tile.
+                    flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, false, true, false>(K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, next_sup, nullptr);
+                } else {
+                    flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, true, false, false>(K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, nbatch_fa, nullptr);
+                }
+            } else {
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, true, oob_check, use_sparse>(K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
+            }
         }
     }
 
@@ -1348,45 +1355,37 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1 || use_sparse) {
-        constexpr bool oob_check = true;
+        constexpr bool oob_check = nstages <= 1;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
-            flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+            flash_attn_ext_f16_iter<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                                    T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>(Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                                                                                       ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                                                                                       KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        flash_attn_ext_f16_iter<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, true,
+                                T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>(Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                                                                                   ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                                                                                   KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
-            flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+            flash_attn_ext_f16_iter<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                                    T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>(Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                                                                                       ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                                                                                       KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        flash_attn_ext_f16_iter<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                                T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>(Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                                                                                   ne01, ne02, ne11, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                                                                                   KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,

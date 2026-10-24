@@ -1282,7 +1282,7 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
 
 static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
 
-static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
+static const char* GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
     "GEGLU",
     "SWIGLU",
@@ -1290,9 +1290,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SITU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -2955,6 +2956,10 @@ static struct ggml_tensor * ggml_glu_impl(
         enum ggml_glu_op      op,
         bool                  swapped) {
     GGML_ASSERT(ggml_is_contiguous_1(a));
+    if (op == GGML_GLU_OP_SITU) {
+        GGML_ASSERT(a->type == GGML_TYPE_F32);
+        GGML_ASSERT(b != NULL || a->ne[0] % 2 == 0);
+    }
 
     if (b) {
         GGML_ASSERT(ggml_is_contiguous_1(b));

@@ -8,6 +8,34 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void cpy_f32_f16_rows_128(
+    const float* src,
+    uint2* dst,
+    int nrows,
+    int nchannels,
+    int total_rows,
+    int64_t stride_row,
+    int64_t stride_channel,
+    int64_t stride_sample) {
+    ggml_cuda_pdl_lc();
+    const int flat = blockIdx.x * 4 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (flat >= total_rows) {
+        return;
+    }
+    const int row     = flat % nrows;
+    const int channel = flat / nrows % nchannels;
+    const int sample  = flat / nrows / nchannels;
+    ggml_cuda_pdl_sync();
+    const float* input             = src + row * stride_row + channel * stride_channel + sample * stride_sample;
+    const float4 value             = reinterpret_cast<const float4*>(input)[lane];
+    const half2 lo                 = __floats2half2_rn(value.x, value.y);
+    const half2 hi                 = __floats2half2_rn(value.z, value.w);
+    dst[int64_t(flat) * 32 + lane] = make_uint2(reinterpret_cast<const uint32_t&>(lo), reinterpret_cast<const uint32_t&>(hi));
+}
+#endif
+
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
@@ -527,6 +555,20 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const uintptr_t input_begin  = reinterpret_cast<uintptr_t>(src0->data);
+        const uintptr_t output_begin = reinterpret_cast<uintptr_t>(src1->data);
+        if (!contiguous_srcs && ne00 == 128 && nb00 == sizeof(float) && ggml_is_contiguous(src1) &&
+            ggml_cuda_is_aligned(src0, alignof(float4)) && reinterpret_cast<uintptr_t>(src1->data) % alignof(uint2) == 0 &&
+            ne / 128 <= INT_MAX && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_AMPERE_GA10X &&
+            (output_begin >= input_begin + ggml_nbytes(src0) || input_begin >= output_begin + ggml_nbytes(src1))) {
+            const ggml_cuda_kernel_launch_params launch_params = {dim3((ne / 128 + 3) / 4), dim3(128), 0, main_stream};
+            ggml_cuda_kernel_launch(cpy_f32_f16_rows_128, launch_params,
+                                    (const float*)src0->data, (uint2*)src1->data, int(ne01), int(ne02), int(ne / 128),
+                                    nb01 / sizeof(float), nb02 / sizeof(float), nb03 / sizeof(float));
+            return;
+        }
+#endif
         if (contiguous_srcs) {
             ggml_cpy_scalar_contiguous_cuda<float, half>
                 (src0_ddc, src1_ddc, ne, main_stream);

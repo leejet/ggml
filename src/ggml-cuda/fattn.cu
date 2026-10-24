@@ -6,6 +6,10 @@
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+DECL_FATTN_MMA_F16_CASE(128, 128, 256, 1);
+#endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
@@ -155,6 +159,23 @@ template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1) {
+        const ggml_tensor* K = dst->src[1];
+        const ggml_tensor* V = dst->src[2];
+        if (cc == GGML_CUDA_CC_AMPERE_GA10X && Q->type == GGML_TYPE_F32 && Q->ne[1] >= 4096 &&
+            Q->ne[2] == 24 && Q->ne[3] == 1 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            K->ne[1] == Q->ne[1] && V->ne[1] == Q->ne[1] && K->ne[2] == 24 && V->ne[2] == 24 &&
+            K->ne[3] == 1 && V->ne[3] == 1 && ggml_is_contiguous(K) && ggml_is_contiguous(V) &&
+            dst->src[3] == nullptr && dst->src[4] == nullptr &&
+            ggml_get_op_params_f32(dst, 1) == 0.0f && ggml_get_op_params_f32(dst, 2) == 0.0f) {
+            // Keep one warp per query column and the original 64-key reduction.
+            ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 256, 1>(ctx, dst);
+            return;
+        }
+    }
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {

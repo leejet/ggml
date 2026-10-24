@@ -453,12 +453,27 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
-static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
-        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+static __device__ __forceinline__ float situ_quantize_value(float g, float h) {
+    const float a       = __fmul_rn(tanhf(__fmul_rn(0.25f, g)), 4.0f);
+    const float b       = __fmul_rn(tanhf(__fmul_rn(1.0f / 25.0f, h)), 25.0f);
+    const float sigmoid = 1.0f / (1.0f + expf(-g));
+    return __fmul_rn(__fmul_rn(a, sigmoid), b);
+}
 
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool situ = false>
+static __global__ void quantize_mmq_q8_1(
+    const float* __restrict__ x,
+    const int32_t* __restrict__ ids,
+    void* __restrict__ vy,
+    const int64_t ne00,
+    const int64_t s01,
+    const int64_t s02,
+    const int64_t s03,
+    const int64_t ne0,
+    const int ne1,
+    const int ne2,
+    const int n_expert_used,
+    const float* up = nullptr) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
@@ -488,7 +503,14 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = i0 < ne00 ? x4[(base_idx + i00) / 4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if constexpr (situ) {
+        if (i0 < ne00) {
+            const float4 h = reinterpret_cast<const float4*>(up)[(base_idx + i00) / 4];
+            xi             = make_float4(situ_quantize_value(xi.x, h.x), situ_quantize_value(xi.y, h.y),
+                                         situ_quantize_value(xi.z, h.z), situ_quantize_value(xi.w, h.w));
+        }
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -552,6 +574,106 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
     GGML_UNUSED(n_expert_used);
+}
+
+template <bool residual_input = false>
+static __global__ void quantize_moss_norm_mmq_q8_1_3072(
+    const float* x,
+    const float* weight,
+    const float* modulation,
+    const float* shift,
+    block_q8_1_mmq* output,
+    int nrows,
+    float eps,
+    const float* branch = nullptr,
+    const float* gate   = nullptr,
+    float* updated      = nullptr,
+    bool residual_first = true) {
+    const int row         = blockIdx.x;
+    const int tid         = threadIdx.x;
+    constexpr int threads = 512;
+    constexpr int groups  = 1024 / threads;
+    float values[groups][3];
+    __shared__ float partials[32];
+#pragma unroll
+    for (int group = 0; group < groups; ++group) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const int col        = tid + group * threads + i * 1024;
+            const int64_t offset = int64_t(row) * 3072 + col;
+            float value          = x[offset];
+            if constexpr (residual_input) {
+                const float product = __fmul_rn(branch[offset], gate[col]);
+                value               = residual_first ? __fadd_rn(value, product) : __fadd_rn(product, value);
+                updated[offset]     = value;
+            }
+            values[group][i] = value;
+            sum              = __fmaf_rn(value, value, sum);
+        }
+        sum = warp_reduce_sum(sum);
+        if (tid % 32 == 0) {
+            partials[(tid + group * threads) / 32] = sum;
+        }
+    }
+    // Preserve all 32 original warp partials while scheduling fewer physical threads.
+    __syncthreads();
+    const float sum   = warp_reduce_sum(partials[tid % 32]);
+    const float scale = rsqrtf(sum / 3072 + eps);
+#pragma unroll
+    for (int group = 0; group < groups; ++group) {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const int col          = tid + group * threads + i * 1024;
+            const float normalized = __fmul_rn(__fmul_rn(scale, values[group][i]), weight[col]);
+            // Keep y + y * modulation + shift as three separately rounded operations.
+            const float value     = __fadd_rn(__fadd_rn(normalized, __fmul_rn(normalized, modulation[col])), shift[col]);
+            const float amax      = warp_reduce_max(fabsf(value));
+            const float inverse   = 127.0f / amax;
+            block_q8_1_mmq* block = output + int64_t(col / 128) * nrows + row;
+            block->qs[col % 128]  = roundf(value * inverse);
+            if (tid % 32 == 0) {
+                block->d4[col % 128 / 32] = 1.0f / inverse;
+            }
+        }
+    }
+}
+
+void quantize_moss_norm_mmq_q8_1_cuda(const ggml_tensor* add, void* output, int64_t padded, cudaStream_t stream, const ggml_tensor* residual_mul) {
+    const ggml_tensor* sum      = add->src[0];
+    const ggml_tensor* weighted = sum->src[0];
+    const ggml_tensor* norm     = weighted->src[0];
+    GGML_ASSERT(norm->ne[0] == 3072 && padded == 3072);
+    if (residual_mul) {
+        const ggml_tensor* updated = norm->src[0];
+        GGML_ASSERT(updated->op == GGML_OP_ADD && residual_mul->op == GGML_OP_MUL &&
+                    (updated->src[0] == residual_mul || updated->src[1] == residual_mul));
+        const bool residual_first   = updated->src[1] == residual_mul;
+        const ggml_tensor* residual = updated->src[residual_first ? 0 : 1];
+        quantize_moss_norm_mmq_q8_1_3072<true><<<norm->ne[1], 512, 0, stream>>>(
+            static_cast<const float*>(residual->data), static_cast<const float*>(weighted->src[1]->data),
+            static_cast<const float*>(sum->src[1]->src[1]->data), static_cast<const float*>(add->src[1]->data),
+            static_cast<block_q8_1_mmq*>(output), norm->ne[1], ggml_get_op_params_f32(norm, 0),
+            static_cast<const float*>(residual_mul->src[0]->data), static_cast<const float*>(residual_mul->src[1]->data),
+            static_cast<float*>(updated->data), residual_first);
+        return;
+    }
+    quantize_moss_norm_mmq_q8_1_3072<false><<<norm->ne[1], 512, 0, stream>>>(
+        static_cast<const float*>(norm->src[0]->data), static_cast<const float*>(weighted->src[1]->data),
+        static_cast<const float*>(sum->src[1]->src[1]->data), static_cast<const float*>(add->src[1]->data),
+        static_cast<block_q8_1_mmq*>(output), norm->ne[1], ggml_get_op_params_f32(norm, 0));
+}
+
+void quantize_situ_mmq_q8_1_cuda(const ggml_tensor* activation, void* output, int64_t padded, cudaStream_t stream) {
+    const ggml_tensor* packed = activation->src[0];
+    const int64_t columns     = activation->ne[0];
+    const bool swapped        = ggml_get_op_params_i32(activation, 1) != 0;
+    const float* gate         = static_cast<const float*>(packed->data) + (swapped ? columns : 0);
+    const float* up           = static_cast<const float*>(packed->data) + (swapped ? 0 : columns);
+    const dim3 blocks(activation->ne[1], (padded + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ));
+    quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<blocks, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, stream>>>(
+        gate, nullptr, output, columns, packed->nb[1] / sizeof(float), packed->nb[2] / sizeof(float), packed->nb[3] / sizeof(float),
+        padded, activation->ne[1], 1, 0, up);
 }
 
 void quantize_row_q8_1_cuda(
