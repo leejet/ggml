@@ -788,8 +788,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_i8_convrot;
+    vk_pipeline pipeline_quantize_i8_convrot_h64;
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
+    vk_pipeline pipeline_mul_mat_w4a4_convrot;
+    vk_pipeline pipeline_mul_mat_w4a8_convrot;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1230,7 +1233,9 @@ struct ggml_backend_vk_context {
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
+    size_t prealloc_size_qconvrot;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    vk_buffer prealloc_qconvrot;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -1253,7 +1258,7 @@ struct ggml_backend_vk_context {
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
-    bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync;
+    bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync, prealloc_qconvrot_need_sync;
 
     vk_context_ref compute_ctx;
 

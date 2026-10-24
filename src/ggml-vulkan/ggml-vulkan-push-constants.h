@@ -889,6 +889,13 @@ struct vk_mul_mat_i8_tensorwise_push_constants {
     uint32_t row_offset;
 };
 
+struct vk_mul_mat_w4_convrot_push_constants {
+    uint32_t n;
+    uint32_t rows;
+    uint32_t k; // logical K = 2 * packed weight width
+    uint32_t has_bias;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
