@@ -136,7 +136,7 @@ void ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx,
                          const ggml_tensor *         src1,
                          const ggml_tensor *         ids,
                          ggml_tensor *               dst,
-                         const ggml_tensor *         fused_activation) {
+                         const ggml_tensor *         fused_input) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -246,9 +246,18 @@ void ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx,
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
-            if (fused_activation) {
+            if (fused_input) {
                 GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && !use_native_fp4);
-                quantize_situ_mmq_q8_1_cuda(fused_activation, src1_q8_1.get(), ne10_padded, stream);
+                if (fused_input->op == GGML_OP_GLU) {
+                    quantize_situ_mmq_q8_1_cuda(fused_input, src1_q8_1.get(), ne10_padded, stream);
+                } else {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                    GGML_ASSERT(fused_input->op == GGML_OP_ADD);
+                    quantize_modulated_rms_norm_mmq_q8_1_cuda(fused_input, src1_q8_1.get(), ne10_padded, stream);
+#else
+                    GGML_ABORT("unsupported fused matrix input");
+#endif
+                }
             } else if (use_native_fp4) {
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
@@ -280,6 +289,7 @@ void ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx,
         return;
     }
 
+    GGML_ASSERT(fused_input == nullptr);
     GGML_ASSERT(ne13 == 1);
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);

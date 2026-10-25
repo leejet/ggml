@@ -4302,6 +4302,42 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_cuda_modulated_rms_norm_mmq_supported(ggml_backend_cuda_context * cuda_ctx,
+                                                       const ggml_tensor *         norm,
+                                                       const ggml_tensor *         weighted,
+                                                       const ggml_tensor *         product,
+                                                       const ggml_tensor *         sum,
+                                                       const ggml_tensor *         add,
+                                                       const ggml_tensor *         mm) {
+    const ggml_tensor * x              = norm->src[0];
+    const ggml_tensor * w              = mm->src[0];
+    const int           cc             = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const auto          f32_contiguous = [](const ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+    const auto vector3072 = [&](const ggml_tensor * t) {
+        return f32_contiguous(t) && t->ne[0] == 3072 && ggml_nelements(t) == 3072;
+    };
+    if (cc == GGML_CUDA_CC_AMPERE_GA10X && weighted->src[0] == norm && product->src[0] == weighted &&
+        sum->src[0] == weighted && sum->src[1] == product && add->src[0] == sum && mm->src[1] == add &&
+        f32_contiguous(x) && f32_contiguous(norm) && f32_contiguous(weighted) && f32_contiguous(product) &&
+        f32_contiguous(sum) && f32_contiguous(add) && f32_contiguous(mm) && vector3072(weighted->src[1]) &&
+        vector3072(product->src[1]) && vector3072(add->src[1]) && x->ne[0] == 3072 && x->ne[1] >= 1024 &&
+        x->ne[2] == 1 && x->ne[3] == 1 && w->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(w) &&
+        w->view_src == nullptr && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 &&
+        ggml_backend_buft_is_cuda(w->buffer->buft) && ggml_cuda_should_use_mmq(w->type, cc, add->ne[1], 0)) {
+        const uintptr_t output_begin = reinterpret_cast<uintptr_t>(mm->data);
+        const uintptr_t weight_begin = reinterpret_cast<uintptr_t>(w->data);
+        if (output_begin < weight_begin + ggml_nbytes(w) && weight_begin < output_begin + ggml_nbytes(mm)) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4310,6 +4346,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_RMS_NORM &&
+        ggml_can_fuse_subgraph(
+            cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_MUL_MAT },
+            { i + 5 })) {
+        const ggml_tensor * add = cgraph->nodes[i + 4];
+        ggml_tensor *       mm  = cgraph->nodes[i + 5];
+        if (ggml_cuda_modulated_rms_norm_mmq_supported(cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                                                       cgraph->nodes[i + 3], add, mm)) {
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], add, nullptr, mm, add);
+            return 5;
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SITU &&
         ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {

@@ -575,6 +575,75 @@ static __global__ void quantize_mmq_q8_1(const float * __restrict__ x,
     GGML_UNUSED(n_expert_used);
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void quantize_modulated_rms_norm_mmq_q8_1_3072(const float *    x,
+                                                                 const float *    weight,
+                                                                 const float *    modulation,
+                                                                 const float *    shift,
+                                                                 block_q8_1_mmq * output,
+                                                                 int              nrows,
+                                                                 float            eps) {
+    const int        row       = blockIdx.x;
+    const int        tid       = threadIdx.x;
+    constexpr int    warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int    threads   = 512;
+    constexpr int    groups    = 1024 / threads;
+    float            values[groups][3];
+    __shared__ float partials[1024 / warp_size];
+#    pragma unroll
+    for (int group = 0; group < groups; ++group) {
+        float sum = 0.0f;
+#    pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const int     col    = tid + group * threads + i * 1024;
+            const int64_t offset = int64_t(row) * 3072 + col;
+            float         value  = x[offset];
+            values[group][i]     = value;
+            sum                  = __fmaf_rn(value, value, sum);
+        }
+        sum = warp_reduce_sum(sum);
+        if (tid % warp_size == 0) {
+            partials[(tid + group * threads) / warp_size] = sum;
+        }
+    }
+    // Preserve all 32 original warp partials while scheduling fewer physical threads.
+    __syncthreads();
+    const float sum   = warp_reduce_sum(partials[tid % warp_size]);
+    const float scale = rsqrtf(sum / 3072 + eps);
+#    pragma unroll
+    for (int group = 0; group < groups; ++group) {
+#    pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const int   col        = tid + group * threads + i * 1024;
+            const float normalized = __fmul_rn(__fmul_rn(scale, values[group][i]), weight[col]);
+            // Keep y + y * modulation + shift as three separately rounded operations.
+            const float value   = __fadd_rn(__fadd_rn(normalized, __fmul_rn(normalized, modulation[col])), shift[col]);
+            const float amax    = warp_reduce_max(fabsf(value));
+            const float inverse = 127.0f / amax;
+            block_q8_1_mmq * block = output + int64_t(col / 128) * nrows + row;
+            block->qs[col % 128]   = roundf(value * inverse);
+            if (tid % warp_size == 0) {
+                block->d4[col % 128 / warp_size] = 1.0f / inverse;
+            }
+        }
+    }
+}
+
+void quantize_modulated_rms_norm_mmq_q8_1_cuda(const ggml_tensor * add,
+                                               void *              output,
+                                               int64_t             padded,
+                                               cudaStream_t        stream) {
+    const ggml_tensor * sum      = add->src[0];
+    const ggml_tensor * weighted = sum->src[0];
+    const ggml_tensor * norm     = weighted->src[0];
+    GGML_ASSERT(norm->ne[0] == 3072 && padded == 3072);
+    quantize_modulated_rms_norm_mmq_q8_1_3072<<<norm->ne[1], 512, 0, stream>>>(
+        static_cast<const float *>(norm->src[0]->data), static_cast<const float *>(weighted->src[1]->data),
+        static_cast<const float *>(sum->src[1]->src[1]->data), static_cast<const float *>(add->src[1]->data),
+        static_cast<block_q8_1_mmq *>(output), norm->ne[1], ggml_get_op_params_f32(norm, 0));
+}
+#endif
+
 void quantize_situ_mmq_q8_1_cuda(const ggml_tensor * activation, void * output, int64_t padded, cudaStream_t stream) {
     const ggml_tensor * packed  = activation->src[0];
     const int64_t       columns = activation->ne[0];

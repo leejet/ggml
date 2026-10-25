@@ -1584,6 +1584,6 @@ void ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx,
                          const ggml_tensor *         src1,
                          const ggml_tensor *         ids,
                          ggml_tensor *               dst,
-                         const ggml_tensor *         fused_activation = nullptr);
+                         const ggml_tensor *         fused_input = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
