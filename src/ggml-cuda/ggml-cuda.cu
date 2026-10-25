@@ -4348,6 +4348,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_MUL && ggml_can_fuse_subgraph(cgraph, i,
+                                                          { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL,
+                                                            GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_MUL_MAT },
+                                                          { i + 1, i + 7 })) {
+        const ggml_tensor * updated        = cgraph->nodes[i + 1];
+        const ggml_tensor * norm           = cgraph->nodes[i + 2];
+        const ggml_tensor * weighted       = cgraph->nodes[i + 3];
+        const ggml_tensor * product        = cgraph->nodes[i + 4];
+        const ggml_tensor * sum            = cgraph->nodes[i + 5];
+        const ggml_tensor * add            = cgraph->nodes[i + 6];
+        ggml_tensor *       mm             = cgraph->nodes[i + 7];
+        const ggml_tensor * residual       = updated->src[0] == node ? updated->src[1] :
+                                             updated->src[1] == node ? updated->src[0] :
+                                                                       nullptr;
+        const ggml_tensor * branch         = node->src[0];
+        const ggml_tensor * gate           = node->src[1];
+        const auto          f32_contiguous = [](const ggml_tensor * t) {
+            return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+        };
+        if (residual && residual != node && norm->src[0] == updated && f32_contiguous(node) &&
+            f32_contiguous(residual) && f32_contiguous(branch) && f32_contiguous(gate) &&
+            ggml_are_same_shape(branch, residual) && ggml_are_same_shape(branch, updated) && gate->ne[0] == 3072 &&
+            ggml_nelements(gate) == 3072 &&
+            ggml_cuda_modulated_rms_norm_mmq_supported(cuda_ctx, norm, weighted, product, sum, add, mm)) {
+            const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const uintptr_t ap = reinterpret_cast<uintptr_t>(a->data);
+                const uintptr_t bp = reinterpret_cast<uintptr_t>(b->data);
+                return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+            };
+            const ggml_tensor * w = mm->src[0];
+            if ((overlap(updated, residual) && updated->data != residual->data) ||
+                (overlap(updated, branch) && updated->data != branch->data) || overlap(updated, gate) ||
+                overlap(updated, weighted->src[1]) || overlap(updated, product->src[1]) ||
+                overlap(updated, add->src[1]) || overlap(updated, w) || overlap(mm, updated) || overlap(mm, w)) {
+                return 0;
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, w, add, nullptr, mm, node);
+            return 7;
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM &&
         ggml_can_fuse_subgraph(
             cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_MUL_MAT },

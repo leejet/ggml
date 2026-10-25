@@ -252,8 +252,13 @@ void ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx,
                     quantize_situ_mmq_q8_1_cuda(fused_input, src1_q8_1.get(), ne10_padded, stream);
                 } else {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-                    GGML_ASSERT(fused_input->op == GGML_OP_ADD);
-                    quantize_modulated_rms_norm_mmq_q8_1_cuda(fused_input, src1_q8_1.get(), ne10_padded, stream);
+                    if (fused_input->op == GGML_OP_MUL) {
+                        quantize_modulated_rms_norm_mmq_q8_1_cuda(src1, src1_q8_1.get(), ne10_padded, stream,
+                                                                  fused_input);
+                    } else {
+                        GGML_ASSERT(fused_input->op == GGML_OP_ADD);
+                        quantize_modulated_rms_norm_mmq_q8_1_cuda(fused_input, src1_q8_1.get(), ne10_padded, stream);
+                    }
 #else
                     GGML_ABORT("unsupported fused matrix input");
 #endif

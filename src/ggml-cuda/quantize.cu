@@ -576,13 +576,18 @@ static __global__ void quantize_mmq_q8_1(const float * __restrict__ x,
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <bool residual_input = false>
 static __global__ void quantize_modulated_rms_norm_mmq_q8_1_3072(const float *    x,
                                                                  const float *    weight,
                                                                  const float *    modulation,
                                                                  const float *    shift,
                                                                  block_q8_1_mmq * output,
                                                                  int              nrows,
-                                                                 float            eps) {
+                                                                 float            eps,
+                                                                 const float *    branch         = nullptr,
+                                                                 const float *    gate           = nullptr,
+                                                                 float *          updated        = nullptr,
+                                                                 bool             residual_first = true) {
     const int        row       = blockIdx.x;
     const int        tid       = threadIdx.x;
     constexpr int    warp_size = ggml_cuda_get_physical_warp_size();
@@ -598,8 +603,13 @@ static __global__ void quantize_modulated_rms_norm_mmq_q8_1_3072(const float *  
             const int     col    = tid + group * threads + i * 1024;
             const int64_t offset = int64_t(row) * 3072 + col;
             float         value  = x[offset];
-            values[group][i]     = value;
-            sum                  = __fmaf_rn(value, value, sum);
+            if constexpr (residual_input) {
+                const float product = __fmul_rn(branch[offset], gate[col]);
+                value               = residual_first ? __fadd_rn(value, product) : __fadd_rn(product, value);
+                updated[offset]     = value;
+            }
+            values[group][i] = value;
+            sum              = __fmaf_rn(value, value, sum);
         }
         sum = warp_reduce_sum(sum);
         if (tid % warp_size == 0) {
@@ -632,12 +642,28 @@ static __global__ void quantize_modulated_rms_norm_mmq_q8_1_3072(const float *  
 void quantize_modulated_rms_norm_mmq_q8_1_cuda(const ggml_tensor * add,
                                                void *              output,
                                                int64_t             padded,
-                                               cudaStream_t        stream) {
+                                               cudaStream_t        stream,
+                                               const ggml_tensor * residual_mul) {
     const ggml_tensor * sum      = add->src[0];
     const ggml_tensor * weighted = sum->src[0];
     const ggml_tensor * norm     = weighted->src[0];
     GGML_ASSERT(norm->ne[0] == 3072 && padded == 3072);
-    quantize_modulated_rms_norm_mmq_q8_1_3072<<<norm->ne[1], 512, 0, stream>>>(
+    if (residual_mul) {
+        const ggml_tensor * updated = norm->src[0];
+        GGML_ASSERT(updated->op == GGML_OP_ADD && residual_mul->op == GGML_OP_MUL &&
+                    (updated->src[0] == residual_mul || updated->src[1] == residual_mul));
+        const bool          residual_first = updated->src[1] == residual_mul;
+        const ggml_tensor * residual       = updated->src[residual_first ? 0 : 1];
+        quantize_modulated_rms_norm_mmq_q8_1_3072<true><<<norm->ne[1], 512, 0, stream>>>(
+            static_cast<const float *>(residual->data), static_cast<const float *>(weighted->src[1]->data),
+            static_cast<const float *>(sum->src[1]->src[1]->data), static_cast<const float *>(add->src[1]->data),
+            static_cast<block_q8_1_mmq *>(output), norm->ne[1], ggml_get_op_params_f32(norm, 0),
+            static_cast<const float *>(residual_mul->src[0]->data),
+            static_cast<const float *>(residual_mul->src[1]->data), static_cast<float *>(updated->data),
+            residual_first);
+        return;
+    }
+    quantize_modulated_rms_norm_mmq_q8_1_3072<false><<<norm->ne[1], 512, 0, stream>>>(
         static_cast<const float *>(norm->src[0]->data), static_cast<const float *>(weighted->src[1]->data),
         static_cast<const float *>(sum->src[1]->src[1]->data), static_cast<const float *>(add->src[1]->data),
         static_cast<block_q8_1_mmq *>(output), norm->ne[1], ggml_get_op_params_f32(norm, 0));

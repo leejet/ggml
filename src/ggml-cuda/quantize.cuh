@@ -30,7 +30,8 @@ void quantize_mmq_q8_1_cuda(
 void quantize_modulated_rms_norm_mmq_q8_1_cuda(const ggml_tensor * add,
                                                void *              output,
                                                int64_t             padded,
-                                               cudaStream_t        stream);
+                                               cudaStream_t        stream,
+                                               const ggml_tensor * residual_mul = nullptr);
 #endif
 
 void quantize_situ_mmq_q8_1_cuda(const ggml_tensor * activation, void * output, int64_t padded, cudaStream_t stream);
