@@ -8,6 +8,77 @@ struct RopeApplyStrides {
     int64_t pe[4];
 };
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void rms_norm_mul_rope_apply_128(const float *    x,
+                                                   const float *    weight,
+                                                   const float *    pe,
+                                                   float *          dst,
+                                                   int              heads,
+                                                   int              tokens,
+                                                   int              total_rows,
+                                                   RopeApplyStrides strides,
+                                                   float            eps) {
+    ggml_cuda_pdl_lc();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int     work      = blockIdx.x * 4 + threadIdx.x / warp_size;
+    const int     lane      = threadIdx.x % warp_size;
+    if (work >= total_rows) {
+        return;
+    }
+    const int head  = work / tokens % heads;
+    const int token = work % tokens;
+    const int batch = work / (heads * tokens);
+    const int row   = work;
+    ggml_cuda_pdl_sync();
+    const float * input = x + head * strides.x[1] + token * strides.x[2] + batch * strides.x[3];
+    float         values[4], sums[4];
+#    pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] = input[lane + warp_size * i];
+        sums[i]   = warp_reduce_sum(__fmul_rn(values[i], values[i]));
+    }
+    // Keep the original 256-thread RMS reduction and the separate mul/add rounding.
+    const float sum   = __fadd_rn(__fadd_rn(sums[0], sums[2]), __fadd_rn(sums[1], sums[3]));
+    const float scale = rsqrtf(sum / 128 + eps);
+#    pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] = __fmul_rn(__fmul_rn(scale, values[i]), weight[lane + warp_size * i]);
+    }
+#    pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int     j                  = lane + warp_size * i;
+        const float * matrix             = pe + j * strides.pe[2] + token * strides.pe[3];
+        const float   c                  = matrix[0];
+        const float   s                  = matrix[strides.pe[1]];
+        const float   a                  = values[i];
+        const float   b                  = values[i + 2];
+        dst[int64_t(row) * 128 + j]      = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+        dst[int64_t(row) * 128 + j + 64] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_rope_apply(ggml_backend_cuda_context & ctx,
+                                          ggml_tensor *               norm,
+                                          ggml_tensor *               mul,
+                                          ggml_tensor *               rope,
+                                          ggml_tensor *               dst) {
+    const ggml_tensor * x      = norm->src[0];
+    const ggml_tensor * weight = mul->src[1];
+    const ggml_tensor * pe     = rope->src[1];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    RopeApplyStrides strides;
+    for (int i = 0; i < 4; ++i) {
+        strides.x[i]  = x->nb[i] / sizeof(float);
+        strides.pe[i] = pe->nb[i] / sizeof(float);
+    }
+    const int                            rows          = int(ggml_nelements(x) / 128);
+    const ggml_cuda_kernel_launch_params launch_params = { dim3((rows + 3) / 4), dim3(128), 0, ctx.stream() };
+    ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128, launch_params, (const float *) x->data,
+                            (const float *) weight->data, (const float *) pe->data, (float *) dst->data, int(x->ne[1]),
+                            int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
+}
+#endif
+
 template<bool interleaved>
 static __global__ void rope_apply_f32(
         const float * x, const float * pe, float * dst,

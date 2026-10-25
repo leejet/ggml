@@ -4308,6 +4308,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_AMPERE_GA10X &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY }, { i + 2 })) {
+        ggml_tensor *       mul      = cgraph->nodes[i + 1];
+        ggml_tensor *       rope     = cgraph->nodes[i + 2];
+        const ggml_tensor * x        = node->src[0];
+        const ggml_tensor * weight   = mul->src[1];
+        const ggml_tensor * pe       = rope->src[1];
+        const auto          overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const uintptr_t ap = reinterpret_cast<uintptr_t>(a->data);
+            const uintptr_t bp = reinterpret_cast<uintptr_t>(b->data);
+            return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+        };
+        if (mul->src[0] == node && rope->src[0] == mul && ggml_get_op_params_i32(rope, 0) == 0 &&
+            x->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+            weight->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 && rope->type == GGML_TYPE_F32 &&
+            x->ne[0] == 128 && x->nb[0] == sizeof(float) && ggml_nelements(x) / 128 <= INT_MAX &&
+            ggml_nelements(weight) == 128 && weight->ne[0] == 128 && ggml_is_contiguous(weight) &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(mul) && ggml_is_contiguous(rope) && !overlaps(rope, x) &&
+            !overlaps(rope, weight) && !overlaps(rope, pe)) {
+            ggml_cuda_op_rms_norm_mul_rope_apply(*cuda_ctx, node, mul, rope, rope);
+            return 2;
+        }
+    }
+#endif
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
