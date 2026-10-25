@@ -4328,6 +4328,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_nelements(weight) == 128 && weight->ne[0] == 128 && ggml_is_contiguous(weight) &&
             ggml_is_contiguous(node) && ggml_is_contiguous(mul) && ggml_is_contiguous(rope) && !overlaps(rope, x) &&
             !overlaps(rope, weight) && !overlaps(rope, pe)) {
+            if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY, GGML_OP_CPY },
+                                       { i + 3 })) {
+                ggml_tensor * cast = cgraph->nodes[i + 3];
+                if (cast->src[0] == rope && cast->src[1] == cast && cast->type == GGML_TYPE_F16 &&
+                    ggml_are_same_shape(cast, rope) && ggml_is_contiguous(cast) && !overlaps(cast, x) &&
+                    !overlaps(cast, weight) && !overlaps(cast, pe)) {
+                    ggml_cuda_op_rms_norm_mul_rope_apply(*cuda_ctx, node, mul, rope, cast);
+                    return 3;
+                }
+            }
             ggml_cuda_op_rms_norm_mul_rope_apply(*cuda_ctx, node, mul, rope, rope);
             return 2;
         }

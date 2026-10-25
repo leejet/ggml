@@ -9,10 +9,11 @@ struct RopeApplyStrides {
 };
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <typename dst_t>
 static __global__ void rms_norm_mul_rope_apply_128(const float *    x,
                                                    const float *    weight,
                                                    const float *    pe,
-                                                   float *          dst,
+                                                   dst_t *          dst,
                                                    int              heads,
                                                    int              tokens,
                                                    int              total_rows,
@@ -53,8 +54,8 @@ static __global__ void rms_norm_mul_rope_apply_128(const float *    x,
         const float   s                  = matrix[strides.pe[1]];
         const float   a                  = values[i];
         const float   b                  = values[i + 2];
-        dst[int64_t(row) * 128 + j]      = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
-        dst[int64_t(row) * 128 + j + 64] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
+        dst[int64_t(row) * 128 + j]      = ggml_cuda_cast<dst_t>(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
+        dst[int64_t(row) * 128 + j + 64] = ggml_cuda_cast<dst_t>(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
     }
 }
 
@@ -66,17 +67,23 @@ void ggml_cuda_op_rms_norm_mul_rope_apply(ggml_backend_cuda_context & ctx,
     const ggml_tensor * x      = norm->src[0];
     const ggml_tensor * weight = mul->src[1];
     const ggml_tensor * pe     = rope->src[1];
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    RopeApplyStrides strides;
+    RopeApplyStrides    strides;
     for (int i = 0; i < 4; ++i) {
         strides.x[i]  = x->nb[i] / sizeof(float);
         strides.pe[i] = pe->nb[i] / sizeof(float);
     }
     const int                            rows          = int(ggml_nelements(x) / 128);
     const ggml_cuda_kernel_launch_params launch_params = { dim3((rows + 3) / 4), dim3(128), 0, ctx.stream() };
-    ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128, launch_params, (const float *) x->data,
-                            (const float *) weight->data, (const float *) pe->data, (float *) dst->data, int(x->ne[1]),
-                            int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
+    if (dst->type == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128<half>, launch_params, (const float *) x->data,
+                                (const float *) weight->data, (const float *) pe->data, (half *) dst->data,
+                                int(x->ne[1]), int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
+    } else {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128<float>, launch_params, (const float *) x->data,
+                                (const float *) weight->data, (const float *) pe->data, (float *) dst->data,
+                                int(x->ne[1]), int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
+    }
 }
 #endif
 
