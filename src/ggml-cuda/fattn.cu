@@ -157,6 +157,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1) {
+        if (ampere_mma_available(cc) &&
+            ggml_cuda_fattn_mma_shared_size(128, 128, 128, 1, cc, ggml_cuda_info().devices[ctx.device].warp_size) <=
+                ggml_cuda_info().devices[ctx.device].smpbo &&
+            Q->ne[1] >= 4096 && Q->ne[1] % 128 == 0 && dst->src[1]->ne[1] >= 4096 && dst->src[3] == nullptr &&
+            Q->ne[2] == dst->src[1]->ne[2]) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 128, 1>(ctx, dst);
+            return;
+        }
+    }
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
         constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
@@ -717,6 +727,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
     return BEST_FATTN_KERNEL_TILE;
 }
+
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
