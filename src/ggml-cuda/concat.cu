@@ -239,7 +239,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
-template <bool permuted>
+template <bool permuted, bool prefix_only = false>
 static __global__ void concat_cast_f16_cuda(
         const float4 * prefix, const float4 * current, half2 * dst,
         int64_t columns4, int64_t prefix_tokens, int64_t tokens, int64_t heads, int64_t count4) {
@@ -249,17 +249,19 @@ static __global__ void concat_cast_f16_cuda(
     }
     const int64_t col = i % columns4;
     const int64_t row = i / columns4;
-    const int64_t token = row % tokens;
-    const int64_t head = (row / tokens) % heads;
-    const int64_t batch = row / (tokens * heads);
-    const bool from_prefix = token < prefix_tokens;
+    const int64_t row_tokens = prefix_only ? prefix_tokens : tokens;
+    const int64_t token = row % row_tokens;
+    const int64_t head = (row / row_tokens) % heads;
+    const int64_t batch = row / (row_tokens * heads);
+    const bool from_prefix = prefix_only || token < prefix_tokens;
     const int64_t src_tokens = from_prefix ? prefix_tokens : tokens - prefix_tokens;
     const int64_t src_token = from_prefix ? token : token - prefix_tokens;
     const int64_t src_row = permuted ? (batch * src_tokens + src_token) * heads + head
                                      : (batch * heads + head) * src_tokens + src_token;
     const float4 value = (from_prefix ? prefix : current)[src_row * columns4 + col];
-    dst[2 * i] = __floats2half2_rn(value.x, value.y);
-    dst[2 * i + 1] = __floats2half2_rn(value.z, value.w);
+    const int64_t output_i = prefix_only ? ((batch * heads + head) * tokens + token) * columns4 + col : i;
+    dst[2 * output_i] = __floats2half2_rn(value.x, value.y);
+    dst[2 * output_i + 1] = __floats2half2_rn(value.z, value.w);
 }
 
 void ggml_cuda_op_concat_cast_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * concat,
@@ -277,6 +279,26 @@ void ggml_cuda_op_concat_cast_f16(ggml_backend_cuda_context & ctx, const ggml_te
     } else {
         concat_cast_f16_cuda<false><<<(count4 + 255) / 256, 256, 0, ctx.stream()>>>(
             prefix, current, (half2 *) output, columns4, prefix_tokens, tokens, heads, count4);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+void ggml_cuda_op_concat_prefix_cast_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * concat,
+                                         bool permuted, void * output) {
+    const int64_t columns4 = concat->ne[0] / 4;
+    const int64_t tokens = concat->ne[permuted ? 2 : 1];
+    const int64_t prefix_tokens = concat->src[0]->ne[permuted ? 2 : 1];
+    const int64_t heads = concat->ne[permuted ? 1 : 2];
+    const int64_t count4 = ggml_nelements(concat->src[0]) / 4;
+    if (count4 == 0) {
+        return;
+    }
+    const float4 * prefix = (const float4 *) concat->src[0]->data;
+    if (permuted) {
+        concat_cast_f16_cuda<true, true><<<(count4 + 255) / 256, 256, 0, ctx.stream()>>>(
+            prefix, nullptr, (half2 *) output, columns4, prefix_tokens, tokens, heads, count4);
+    } else {
+        concat_cast_f16_cuda<false, true><<<(count4 + 255) / 256, 256, 0, ctx.stream()>>>(
+            prefix, nullptr, (half2 *) output, columns4, prefix_tokens, tokens, heads, count4);
     }
     CUDA_CHECK(cudaGetLastError());
 }
