@@ -132,6 +132,23 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    if (GGML_CUDA_CUTLASS_PATH)
+        if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/gemm/kernel/default_gemm_universal_with_visitor.h" OR
+            NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cute/tensor.hpp")
+            message(FATAL_ERROR
+                "CUTLASS headers not found at ${GGML_CUDA_CUTLASS_PATH}. "
+                "Run git submodule update --init --recursive from the repository root, "
+                "set GGML_CUDA_CUTLASS_PATH to a CUTLASS source tree (tested with 3.9.2), "
+                "or set GGML_CUDA_CUTLASS_PATH to an empty string to disable CUTLASS.")
+        endif()
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUTLASS)
+        set_property(SOURCE mul-mat-i8.cu fattn-cute.cu APPEND PROPERTY INCLUDE_DIRECTORIES "${GGML_CUDA_CUTLASS_PATH}/include")
+        set_property(SOURCE mul-mat-i8.cu fattn-cute.cu APPEND PROPERTY COMPILE_OPTIONS --extended-lambda --expt-relaxed-constexpr)
+        if (MSVC)
+            set_property(SOURCE mul-mat-i8.cu fattn-cute.cu APPEND PROPERTY COMPILE_OPTIONS -Xcompiler=/Zc:preprocessor,/Zc:__cplusplus)
+        endif()
+    endif()
+
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUBLASLT_FP8)
         if (NOT GGML_STATIC OR WIN32)
