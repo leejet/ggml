@@ -11,12 +11,52 @@ struct ggml_cuda_i8_tile_config {
     using Warp = cutlass::gemm::GemmShape<WM, 64, 64>;
 };
 
+enum ggml_cuda_i8_tile {
+    GGML_CUDA_I8_TILE_128_256,
+    GGML_CUDA_I8_TILE_128_128,
+    GGML_CUDA_I8_TILE_64_128,
+    GGML_CUDA_I8_TILE_16_128,
+};
+
+static ggml_cuda_i8_tile ggml_cuda_mul_mat_i8_get_tile(int64_t rows, int64_t n, int nsm) {
+    const int64_t columns = (n + 127) / 128;
+    if (((rows + 15) / 16) * columns <= nsm) {
+        return GGML_CUDA_I8_TILE_16_128;
+    }
+    if (((rows + 63) / 64) * columns <= nsm) {
+        return GGML_CUDA_I8_TILE_64_128;
+    }
+    const int64_t wide_tiles = ((rows + 127) / 128) * ((n + 255) / 256);
+    const int64_t square_tiles = ((rows + 127) / 128) * columns;
+    // A narrower tile costs more per output element, but can waste less of the last wave.
+    const double wide_cost = double((wide_tiles + nsm - 1) / nsm) / wide_tiles;
+    const double square_cost = 1.08 * double((square_tiles + nsm - 1) / nsm) / square_tiles;
+    return wide_cost <= square_cost ? GGML_CUDA_I8_TILE_128_256 : GGML_CUDA_I8_TILE_128_128;
+}
+
 template <class Launch>
 static bool ggml_cuda_mul_mat_i8_dispatch(ggml_backend_cuda_context& ctx, int64_t rows, int64_t n, Launch launch) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(rows);
-    GGML_UNUSED(n);
-    return launch(ggml_cuda_i8_tile_config<128, 256, 64>{});
+    const ggml_cuda_i8_tile tile = ggml_cuda_mul_mat_i8_get_tile(rows, n, ggml_cuda_info().devices[ctx.device].nsm);
+    auto launch_tile = [&](ggml_cuda_i8_tile tile) {
+        switch (tile) {
+            case GGML_CUDA_I8_TILE_128_256: return launch(ggml_cuda_i8_tile_config<128, 256, 64>{});
+            case GGML_CUDA_I8_TILE_128_128: return launch(ggml_cuda_i8_tile_config<128, 128, 64>{});
+            case GGML_CUDA_I8_TILE_64_128:  return launch(ggml_cuda_i8_tile_config< 64, 128, 32>{});
+            case GGML_CUDA_I8_TILE_16_128:  return launch(ggml_cuda_i8_tile_config< 16, 128, 16>{});
+            default: GGML_ABORT("invalid INT8 GEMM tile");
+        }
+    };
+    if (launch_tile(tile)) {
+        return true;
+    }
+    // A tile can exceed a device's shared-memory limit even when its ISA is supported.
+    for (ggml_cuda_i8_tile fallback : {GGML_CUDA_I8_TILE_128_256, GGML_CUDA_I8_TILE_128_128,
+                                      GGML_CUDA_I8_TILE_64_128, GGML_CUDA_I8_TILE_16_128}) {
+        if (fallback != tile && launch_tile(fallback)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <class T>
@@ -60,7 +100,7 @@ static bool ggml_cuda_mul_mat_i8_cutlass_impl(
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!ampere_mma_available(cc) ||
         rows < 128 || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX ||
-        n % 256 != 0 || k % 64 != 0 || w_scales == nullptr ||
+        n % 128 != 0 || k % 64 != 0 || w_scales == nullptr ||
         ((uintptr_t)x | (uintptr_t)w | (uintptr_t)x_scales | (uintptr_t)w_scales | (uintptr_t)dst | (uintptr_t)gate | (uintptr_t)residual) % 16 != 0) {
         return false;
     }
@@ -257,7 +297,7 @@ bool ggml_cuda_mul_mat_i8_swiglu_cutlass(
     int64_t k) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!ampere_mma_available(cc) ||
-        rows < 128 || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX || n % 512 != 0 || k % 64 != 0 || ws == nullptr ||
+        rows < 128 || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX || n % 256 != 0 || k % 64 != 0 || ws == nullptr ||
         ((uintptr_t)x | (uintptr_t)w | (uintptr_t)xs | (uintptr_t)ws | (uintptr_t)out) % 16 != 0)
         return false;
     const cudaStream_t stream = ctx.stream();
