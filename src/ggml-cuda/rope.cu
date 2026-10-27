@@ -3,6 +3,103 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+template <int D, bool interleaved, typename T>
+static __global__ void rms_norm_mul_rope_apply_fused(
+        const float * x, const float * weight, const float * pe, T * dst,
+        int64_t heads, int64_t tokens, int64_t rows, float eps, float output_scale) {
+    const int lane = threadIdx.x;
+    const int64_t row = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
+    if (row >= rows) {
+        return;
+    }
+    float v[D / 32], sums[8] = {};
+#pragma unroll
+    for (int j = 0; j < D / 32; ++j) {
+        v[j] = x[row * D + j * 32 + lane];
+        sums[j] = warp_reduce_sum<32>(__fmul_rn(v[j], v[j]));
+    }
+    // Preserve the 256-thread RMSNorm kernel's reduction tree, including inactive warps.
+    const float sum = __fadd_rn(
+        __fadd_rn(__fadd_rn(sums[0], sums[4]), __fadd_rn(sums[2], sums[6])),
+        __fadd_rn(__fadd_rn(sums[1], sums[5]), __fadd_rn(sums[3], sums[7])));
+    const float scale = rsqrtf(sum / float(D) + eps);
+    const int64_t head = row % heads;
+    const int64_t token = (row / heads) % tokens;
+    const int64_t batch = row / (heads * tokens);
+    T * out = dst + ((batch * heads + head) * tokens + token) * D;
+#pragma unroll
+    for (int j = 0; j < D / 32; ++j) {
+        const int col = j * 32 + lane;
+        const float value = __fmul_rn(__fmul_rn(scale, v[j]), weight[col]);
+        float rotated;
+        if constexpr (interleaved) {
+            const float other = __shfl_xor_sync(0xffffffff, value, 1, 32);
+            const float4 matrix = ((const float4 *) pe)[token * (D / 2) + col / 2];
+            rotated = lane % 2 == 0
+                ? __fadd_rn(__fmul_rn(value, matrix.x), __fmul_rn(other, matrix.y))
+                : __fadd_rn(__fmul_rn(other, matrix.z), __fmul_rn(value, matrix.w));
+        } else {
+            const int partner = col < D / 2 ? col + D / 2 : col - D / 2;
+            const float other = __fmul_rn(__fmul_rn(scale, x[row * D + partner]), weight[partner]);
+            const float4 matrix = ((const float4 *) pe)[token * (D / 2) + col % (D / 2)];
+            rotated = col < D / 2
+                ? __fsub_rn(__fmul_rn(value, matrix.x), __fmul_rn(other, matrix.z))
+                : __fadd_rn(__fmul_rn(other, matrix.z), __fmul_rn(value, matrix.x));
+        }
+        if constexpr (std::is_same<T, half>::value) {
+            out[col] = __float2half_rn(__fmul_rn(rotated, output_scale));
+        } else {
+            out[col] = rotated;
+        }
+    }
+}
+
+template <typename T, bool interleaved>
+static void rms_norm_mul_rope_apply_fused_cuda(ggml_backend_cuda_context & ctx,
+        ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope, T * output, float scale) {
+    const ggml_tensor * x = norm->src[0];
+    const int64_t rows = ggml_nrows(x);
+#define LAUNCH_RMS_ROPE(D) \
+    case D: \
+        rms_norm_mul_rope_apply_fused<D, interleaved, T><<<(rows + 3) / 4, dim3(32, 4), 0, ctx.stream()>>>( \
+            (const float *) x->data, (const float *) mul->src[1]->data, (const float *) rope->src[1]->data, \
+            output, x->ne[1], x->ne[2], rows, ggml_get_op_params_f32(norm, 0), scale); \
+        break
+    switch (x->ne[0]) {
+        LAUNCH_RMS_ROPE(32);
+        LAUNCH_RMS_ROPE(64);
+        LAUNCH_RMS_ROPE(96);
+        LAUNCH_RMS_ROPE(128);
+        LAUNCH_RMS_ROPE(160);
+        LAUNCH_RMS_ROPE(192);
+        LAUNCH_RMS_ROPE(224);
+        LAUNCH_RMS_ROPE(256);
+        default: GGML_ABORT("unsupported fused RMSNorm/RoPE dimension");
+    }
+#undef LAUNCH_RMS_ROPE
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+static void rms_norm_mul_rope_apply_fused_cuda(ggml_backend_cuda_context & ctx,
+        ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope, T * output, float scale) {
+    if (ggml_get_op_params_i32(rope, 0)) {
+        rms_norm_mul_rope_apply_fused_cuda<T, true>(ctx, norm, mul, rope, output, scale);
+    } else {
+        rms_norm_mul_rope_apply_fused_cuda<T, false>(ctx, norm, mul, rope, output, scale);
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_rope_apply_fused(ggml_backend_cuda_context & ctx,
+        ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * dst, float * output) {
+    rms_norm_mul_rope_apply_fused_cuda(ctx, norm, mul, dst, output, 1.0f);
+}
+
+void ggml_cuda_op_rms_norm_mul_rope_apply_f16(ggml_backend_cuda_context & ctx,
+        ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope, half * output, float scale) {
+    rms_norm_mul_rope_apply_fused_cuda(ctx, norm, mul, rope, output, scale);
+}
+
 struct RopeApplyStrides {
     int64_t x[4];
     int64_t pe[4];
