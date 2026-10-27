@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/mul-mat-i8.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -1669,6 +1670,34 @@ __global__ void dequantize_i32_rows_cuda(
     }
 }
 
+__global__ void dequantize_i32_rows_vec4_cuda(
+        const int4 * src, const float * scales, const float4 * weight_scales,
+        const float4 * bias, float4 * dst, int64_t n4) {
+    const int64_t output = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (output >= n4) {
+        return;
+    }
+    const int64_t index = (int64_t) blockIdx.y * n4 + output;
+    const int4 v = src[index];
+    const float scale = scales[blockIdx.y];
+    float4 value = make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale);
+    if (weight_scales != nullptr) {
+        const float4 w = weight_scales[output];
+        value.x *= w.x;
+        value.y *= w.y;
+        value.z *= w.z;
+        value.w *= w.w;
+    }
+    if (bias != nullptr) {
+        const float4 b = bias[output];
+        value.x += b.x;
+        value.y += b.y;
+        value.z += b.z;
+        value.w += b.w;
+    }
+    dst[index] = value;
+}
+
 static void ggml_cuda_quantize_i8_convrot(
         ggml_backend_cuda_context & ctx,
         const float * src,
@@ -1786,6 +1815,13 @@ static void ggml_cuda_mul_mat_i8(
 
     const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
     const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+    if (bias == nullptr &&
+        ggml_cuda_mul_mat_i8_cutlass(ctx, qdata_d, (const int8_t *) src0->data, scales_d, weight_scales,
+                                   (float *) dst->data, rows, n, k)) {
+        return;
+    }
+#endif
     ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
 
     const int32_t alpha = 1;
@@ -1797,6 +1833,14 @@ static void ggml_cuda_mul_mat_i8(
                 qdata_d, CUDA_R_8I, (int)qstride,
         &beta,  accum.get(), CUDA_R_32I, (int)n,
         CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    if (n % 4 == 0 && ((uintptr_t) weight_scales | (uintptr_t) bias | (uintptr_t) dst->data) % 16 == 0) {
+        const dim3 dequant_grid((n + 1023) / 1024, rows, 1);
+        dequantize_i32_rows_vec4_cuda<<<dequant_grid, 256, 0, stream>>>(
+            (const int4 *) accum.get(), scales_d, (const float4 *) weight_scales,
+            (const float4 *) bias, (float4 *) dst->data, n / 4);
+        return;
+    }
 
     const dim3 dequant_grid((n + 255) / 256, rows, 1);
     dequantize_i32_rows_cuda<<<dequant_grid, 256, 0, stream>>>(
@@ -4299,6 +4343,132 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+
+
+
+
+
+static __global__ void gated_residual_f32_cuda(
+        const float4 * x, const float4 * gate, const float4 * residual, float4 * dst, int64_t n4, int64_t count4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count4) {
+        return;
+    }
+    const float4 a = x[i], g = gate[i % n4], r = residual[i];
+    // Preserve the two separate FP32 operations instead of contracting into FMA.
+    dst[i] = make_float4(__fadd_rn(__fmul_rn(a.x, g.x), r.x), __fadd_rn(__fmul_rn(a.y, g.y), r.y),
+                        __fadd_rn(__fmul_rn(a.z, g.z), r.z), __fadd_rn(__fmul_rn(a.w, g.w), r.w));
+}
+
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+static int ggml_cuda_can_fuse_i8_gated_residual(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * mat = cgraph->nodes[i];
+    if (mat->op != GGML_OP_MUL_MAT || mat->src[0]->type != GGML_TYPE_I8 ||
+        mat->src[2] == nullptr || mat->src[3] != nullptr || !ggml_mul_mat_has_packed_i8_input(mat) || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const bool scaled = cgraph->nodes[i + 1]->op == GGML_OP_SCALE;
+    const int count = scaled ? 4 : 3;
+    if (scaled) {
+        const ggml_tensor * scale = cgraph->nodes[i + 1];
+        if (scale->src[0] != mat || ggml_get_op_params_f32(scale, 1) != 0.0f ||
+            !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 })) {
+            return 0;
+        }
+    } else if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
+        return 0;
+    }
+    const ggml_tensor * mul = cgraph->nodes[i + count - 2];
+    const ggml_tensor * dst = cgraph->nodes[i + count - 1];
+    const ggml_tensor * gate = mul->src[1];
+    const ggml_tensor * residual = dst->src[0] == mul ? dst->src[1] : dst->src[0];
+    if (mul->src[0] != cgraph->nodes[i + count - 3] || (dst->src[0] != mul && dst->src[1] != mul) ||
+        !ggml_are_same_shape(mat, dst) || !ggml_are_same_shape(residual, dst) ||
+        gate->ne[0] != mat->ne[0] || ggml_nelements(gate) != mat->ne[0]) {
+        return 0;
+    }
+    for (const ggml_tensor * tensor : {mat, mul, gate, residual, dst}) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+            return 0;
+        }
+    }
+    return ggml_is_contiguous(mat->src[0]) && ggml_is_contiguous(mat->src[1]) &&
+        mat->src[0]->ne[2] == 1 && mat->src[0]->ne[3] == 1 ? count : 0;
+}
+
+static int ggml_cuda_try_fuse_i8_gated_residual(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const int count = ggml_cuda_can_fuse_i8_gated_residual(cgraph, i);
+    if (count == 0) {
+        return 0;
+    }
+    ggml_tensor * mat = cgraph->nodes[i];
+    ggml_tensor * mul = cgraph->nodes[i + count - 2];
+    ggml_tensor * dst = cgraph->nodes[i + count - 1];
+    const ggml_tensor * residual = dst->src[0] == mul ? dst->src[1] : dst->src[0];
+    const ggml_tensor * gate = mul->src[1];
+    bool overlaps = false;
+    for (const ggml_tensor * tensor : std::initializer_list<const ggml_tensor *>{mat->src[0], mat->src[1], mat->src[2], gate, residual}) {
+        if (tensor == residual && tensor->data == dst->data) {
+            continue;
+        }
+        overlaps |= (uintptr_t) tensor->data < (uintptr_t) dst->data + ggml_nbytes(dst) &&
+                    (uintptr_t) dst->data < (uintptr_t) tensor->data + ggml_nbytes(tensor);
+    }
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool());
+    float * output = overlaps ? scratch.alloc(ggml_nelements(dst)) : (float *) dst->data;
+    const int64_t rows = ggml_nrows(dst);
+    const int64_t k = mat->src[0]->ne[0];
+    const int8_t * packed = (const int8_t *) mat->src[1]->data;
+    if (!ggml_cuda_mul_mat_i8_cutlass_residual(ctx, packed, (const int8_t *) mat->src[0]->data,
+        (const float *) (packed + k * GGML_PAD(rows, 4)), (const float *) mat->src[2]->data,
+        output, rows, dst->ne[0], k, (const float *) gate->data, (const float *) residual->data,
+        count == 4 ? ggml_get_op_params_f32(cgraph->nodes[i + 1], 0) : 1.0f)) {
+        return 0;
+    }
+    if (overlaps) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, output, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    return count;
+}
+#endif
+
+static bool ggml_cuda_try_fuse_gated_residual(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD })) {
+        return false;
+    }
+    const ggml_tensor * mul = cgraph->nodes[i];
+    ggml_tensor * dst = cgraph->nodes[i + 1];
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * gate = mul->src[1];
+    const ggml_tensor * residual = dst->src[0] == mul ? dst->src[1] : dst->src[0];
+    if ((dst->src[0] != mul && dst->src[1] != mul) || !ggml_are_same_shape(x, dst) ||
+            !ggml_are_same_shape(residual, dst) || gate->ne[0] != x->ne[0] ||
+            ggml_nelements(gate) != x->ne[0] || x->ne[0] % 4 != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : { x, gate, residual, (const ggml_tensor *) dst }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || (uintptr_t) t->data % 16 != 0) {
+            return false;
+        }
+        if (t == dst || (t != gate && t->data == dst->data)) {
+            continue;
+        }
+        const uintptr_t begin = (uintptr_t) t->data, end = begin + ggml_nbytes(t);
+        const uintptr_t dst_begin = (uintptr_t) dst->data, dst_end = dst_begin + ggml_nbytes(dst);
+        if (begin < dst_end && dst_begin < end) {
+            return false;
+        }
+    }
+    const int64_t count4 = ggml_nelements(dst) / 4;
+    gated_residual_f32_cuda<<<(count4 + 255) / 256, 256, 0, ctx.stream()>>>(
+        (const float4 *) x->data, (const float4 *) gate->data, (const float4 *) residual->data,
+        (float4 *) dst->data, x->ne[0] / 4, count4);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4307,6 +4477,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+    if (const int count = ggml_cuda_try_fuse_i8_gated_residual(*cuda_ctx, cgraph, i)) {
+        return count - 1;
+    }
+#endif
+    if (node->op == GGML_OP_MUL && ggml_cuda_try_fuse_gated_residual(*cuda_ctx, cgraph, i)) {
+        return 1;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5437,6 +5616,30 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+        for (int i = 2; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * mul = cgraph->nodes[i];
+            if (mul->op != GGML_OP_MUL || mul->src[0] == mul->src[1]) {
+                continue;
+            }
+            const ggml_tensor * producer = mul->src[0];
+            if (producer->op != GGML_OP_RMS_NORM &&
+                !(producer->op == GGML_OP_MUL_MAT && producer->src[0]->type == GGML_TYPE_I8)) {
+                continue;
+            }
+            for (int j = i - 1; j >= std::max(0, i - 64); --j) {
+                const ggml_tensor * candidate = cgraph->nodes[j];
+                if (candidate == producer) {
+                    if (j + 1 < i && ggml_node_has_n_uses(cgraph, j, 1)) {
+                        // Compute independent affine operands first to expose existing fusion patterns.
+                        std::rotate(cgraph->nodes + j, cgraph->nodes + j + 1, cgraph->nodes + i);
+                    }
+                    break;
+                }
+                if (candidate->view_src != nullptr && !ggml_cuda_is_view_or_noop(candidate)) {
+                    break;
+                }
+            }
+        }
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;
@@ -5458,6 +5661,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+            if (const int count = ggml_cuda_can_fuse_i8_gated_residual(cgraph, i)) {
+                add_alloc_deps(i, i + count - 1);
+            }
+#endif
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
