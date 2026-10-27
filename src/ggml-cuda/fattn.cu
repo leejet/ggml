@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-cute.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -728,6 +729,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+#ifdef GGML_CUDA_USE_CUTLASS
+bool ggml_cuda_fattn_cute_preferred(int device, const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_cute_supported(device, dst)) {
+        return false;
+    }
+    if (ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_NONE) {
+        return true;
+    }
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    // Conversion and full-tile work dominate small inputs; keep the native kernels for those.
+    if (q->ne[0] == 40 || q->ne[0] == 72) {
+        return q->ne[1] >= 512 && k->ne[1] >= 512;
+    }
+    if (q->ne[0] == 80 || q->ne[0] == 96 || q->ne[0] == 112) {
+        return false;
+    }
+    const int min_sequence = q->ne[0] == 128 ? 2048 : 4096;
+    return q->ne[1] >= min_sequence && k->ne[1] >= min_sequence;
+}
+#endif
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -767,6 +789,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#ifdef GGML_CUDA_USE_CUTLASS
+    if (ggml_cuda_fattn_cute_preferred(ctx.device, dst) && ggml_cuda_try_fattn_cute(ctx, dst)) {
+        return;
+    }
+#endif
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -783,5 +810,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_USE_CUTLASS
+    if (ggml_cuda_fattn_cute_supported(device, dst)) {
+        return true;
+    }
+#endif
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
