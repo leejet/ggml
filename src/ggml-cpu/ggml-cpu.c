@@ -1219,7 +1219,7 @@ static void ggml_compute_forward_mul_mat_i8_f32(
     int8_t * qdata = prequantized ? (int8_t *)src1->data : (int8_t *)params->wdata;
     float * scales = prequantized ? NULL : (float *)((char *)params->wdata + scale_offset);
     const float * packed_scales = prequantized
-        ? (const float *)((const int8_t *)src1->data + k * rows_padded)
+        ? ggml_mul_mat_i8_input_scales(dst)
         : NULL;
     const float * src1_data = prequantized ? NULL : (const float *)src1->data;
 

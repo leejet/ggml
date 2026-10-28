@@ -4,6 +4,30 @@
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/kernel/default_gemm_universal_with_visitor.h>
 #include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
+#include <cutlass/gemm/threadblock/threadblock_swizzle_streamk.h>
+
+struct ggml_cuda_i8_banded_streamk : cutlass::gemm::threadblock::ThreadblockSwizzleStreamK {
+    using Base = cutlass::gemm::threadblock::ThreadblockSwizzleStreamK;
+    using Base::Base;
+
+    CUTLASS_DEVICE cutlass::gemm::GemmCoord get_tile_offset(int index) const {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+        const auto shape = tiled_shape();
+        if (problem_size.m() >= 4096 && problem_size.n() >= 16384 && shape.m() >= shape.n()) {
+            // Column bands retain weight tiles in Ada's L2 across successive row tiles.
+            constexpr int band_width = 16;
+            if (index >= shape.m() * shape.n()) {
+                return {shape.m(), shape.n(), get_batch_idx()};
+            }
+            const int band   = index / (shape.m() * band_width);
+            const int width  = min(band_width, shape.n() - band * band_width);
+            const int within = index - band * shape.m() * band_width;
+            return {within / width, band * band_width + within % width, get_batch_idx()};
+        }
+#endif
+        return Base::get_tile_offset(index);
+    }
+};
 
 template <int M, int N, int WM>
 struct ggml_cuda_i8_tile_config {
@@ -18,7 +42,20 @@ enum ggml_cuda_i8_tile {
     GGML_CUDA_I8_TILE_16_128,
 };
 
+static bool ggml_cuda_i8_use_streamk(int64_t rows) {
+    // Scratch initialization and split-K reduction outweigh the benefit on shorter matrices.
+    return rows >= 8192;
+}
+
+static bool ggml_cuda_i8_small_rows_enabled(int64_t rows, int64_t n, int64_t k) {
+    static const char * setting = std::getenv("GGML_CUDA_I8_SMALL_ROWS");
+    return setting ? std::atoi(setting) != 0 : rows < 32 && n >= 4096 && k >= 4096;
+}
+
 static ggml_cuda_i8_tile ggml_cuda_mul_mat_i8_get_tile(int64_t rows, int64_t n, int nsm) {
+    if (rows < 32) {
+        return GGML_CUDA_I8_TILE_16_128;
+    }
     const int64_t columns = (n + 127) / 128;
     if (((rows + 15) / 16) * columns <= nsm) {
         return GGML_CUDA_I8_TILE_16_128;
@@ -83,7 +120,7 @@ struct ggml_cuda_i8_add_round {
     }
 };
 
-template <bool gated, bool scaled, class Config>
+template <bool gated, bool scaled, class Config, bool stream_k>
 static bool ggml_cuda_mul_mat_i8_cutlass_impl(
     ggml_backend_cuda_context& ctx,
     const int8_t* x,
@@ -99,7 +136,7 @@ static bool ggml_cuda_mul_mat_i8_cutlass_impl(
     float output_scale) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!ampere_mma_available(cc) ||
-        rows < 128 || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX ||
+        rows < (ggml_cuda_i8_small_rows_enabled(rows, n, k) ? 1 : 128) || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX ||
         n % 128 != 0 || k % 64 != 0 || w_scales == nullptr ||
         ((uintptr_t)x | (uintptr_t)w | (uintptr_t)x_scales | (uintptr_t)w_scales | (uintptr_t)dst | (uintptr_t)gate | (uintptr_t)residual) % 16 != 0) {
         return false;
@@ -107,6 +144,8 @@ static bool ggml_cuda_mul_mat_i8_cutlass_impl(
 
     using Tile         = typename Config::Tile;
     using Warp         = typename Config::Warp;
+    using Swizzle      = std::conditional_t<stream_k, ggml_cuda_i8_banded_streamk,
+                                           cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>;
     using Map          = cutlass::epilogue::threadblock::OutputTileThreadLayout<Tile, Warp, float, 4, 1>;
     using Col          = cutlass::epilogue::threadblock::VisitorColBroadcast<Map, float, cute::Stride<cute::_1, cute::_0, int>>;
     using Row          = cutlass::epilogue::threadblock::VisitorRowBroadcast<Map, float, cute::Stride<cute::_0, cute::_1, int>>;
@@ -130,7 +169,7 @@ static bool ggml_cuda_mul_mat_i8_cutlass_impl(
         int8_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 16,
         float, cutlass::layout::RowMajor, 4, int, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
         Tile, Warp, cutlass::gemm::GemmShape<16, 8, 32>, Epilogue,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 4, cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
+        Swizzle, 4, cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 
     typename ScaleW::Arguments scales = {{{}, {x_scales, 0.0f, {}}, {}}, {w_scales, 0.0f, {}}, {}};
@@ -154,7 +193,12 @@ static bool ggml_cuda_mul_mat_i8_cutlass_impl(
         gemm.can_implement(args) != cutlass::Status::kSuccess) {
         return false;
     }
-    GGML_ASSERT(gemm.initialize(args, nullptr, ctx.stream()) == cutlass::Status::kSuccess);
+    ggml_cuda_pool_alloc<char> workspace(ctx.pool());
+    const size_t workspace_size = gemm.get_workspace_size(args);
+    if (workspace_size > 0) {
+        workspace.alloc(workspace_size);
+    }
+    GGML_ASSERT(gemm.initialize(args, workspace.get(), ctx.stream()) == cutlass::Status::kSuccess);
     GGML_ASSERT(gemm(ctx.stream()) == cutlass::Status::kSuccess);
     return true;
 }
@@ -168,11 +212,14 @@ bool ggml_cuda_mul_mat_i8_cutlass(
     int64_t rows,
     int64_t n,
     int64_t k) {
-    if (rows < 128 || n <= 0 || rows > INT_MAX || n > INT_MAX) {
+    if (rows < (ggml_cuda_i8_small_rows_enabled(rows, n, k) ? 1 : 128) || n <= 0 || rows > INT_MAX || n > INT_MAX) {
         return false;
     }
     return ggml_cuda_mul_mat_i8_dispatch(ctx, rows, n, [&](auto config) {
-        return ggml_cuda_mul_mat_i8_cutlass_impl<false, false, decltype(config)>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, nullptr, nullptr, 1.0f);
+        if (ggml_cuda_i8_use_streamk(rows)) {
+            return ggml_cuda_mul_mat_i8_cutlass_impl<false, false, decltype(config), true>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, nullptr, nullptr, 1.0f);
+        }
+        return ggml_cuda_mul_mat_i8_cutlass_impl<false, false, decltype(config), false>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, nullptr, nullptr, 1.0f);
     });
 }
 
@@ -189,14 +236,20 @@ bool ggml_cuda_mul_mat_i8_cutlass_residual(
     const float* gate,
     const float* residual,
     float output_scale) {
-    if (rows < 128 || n <= 0 || rows > INT_MAX || n > INT_MAX) {
+    if (rows < (ggml_cuda_i8_small_rows_enabled(rows, n, k) ? 1 : 128) || n <= 0 || rows > INT_MAX || n > INT_MAX) {
         return false;
     }
     return ggml_cuda_mul_mat_i8_dispatch(ctx, rows, n, [&](auto config) {
         if (output_scale != 1.0f) {
-            return ggml_cuda_mul_mat_i8_cutlass_impl<true, true, decltype(config)>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, gate, residual, output_scale);
+            if (ggml_cuda_i8_use_streamk(rows)) {
+                return ggml_cuda_mul_mat_i8_cutlass_impl<true, true, decltype(config), true>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, gate, residual, output_scale);
+            }
+            return ggml_cuda_mul_mat_i8_cutlass_impl<true, true, decltype(config), false>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, gate, residual, output_scale);
         }
-        return ggml_cuda_mul_mat_i8_cutlass_impl<true, false, decltype(config)>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, gate, residual, output_scale);
+        if (ggml_cuda_i8_use_streamk(rows)) {
+            return ggml_cuda_mul_mat_i8_cutlass_impl<true, false, decltype(config), true>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, gate, residual, output_scale);
+        }
+        return ggml_cuda_mul_mat_i8_cutlass_impl<true, false, decltype(config), false>(ctx, x, w, x_scales, w_scales, dst, rows, n, k, gate, residual, output_scale);
     });
 }
 // The iterator pairs gate/up columns while reading the original checkpoint layout.
@@ -248,7 +301,7 @@ static __global__ void ggml_cuda_i8_pair_scales(const float* src, float* dst, in
         dst[i] = src[i / 2 + (i % 2) * (n / 2)];
 }
 
-template <class Config>
+template <class Config, bool stream_k>
 static bool ggml_cuda_mul_mat_i8_swiglu_impl(
     ggml_backend_cuda_context& ctx,
     const int8_t* x,
@@ -262,7 +315,8 @@ static bool ggml_cuda_mul_mat_i8_swiglu_impl(
     const cudaStream_t stream = ctx.stream();
     using Tile                  = typename Config::Tile;
     using Warp                  = typename Config::Warp;
-    using Swizzle               = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+    using Swizzle               = std::conditional_t<stream_k, ggml_cuda_i8_banded_streamk,
+                                                     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>;
     using Map                   = cutlass::epilogue::threadblock::OutputTileThreadLayout<Tile, Warp, float, 4, 1>;
     using Col                   = cutlass::epilogue::threadblock::VisitorColBroadcast<Map, float, cute::Stride<cute::_1, cute::_0, int>>;
     using Row                   = cutlass::epilogue::threadblock::VisitorRowBroadcast<Map, float, cute::Stride<cute::_0, cute::_1, int>>;
@@ -273,7 +327,9 @@ static bool ggml_cuda_mul_mat_i8_swiglu_impl(
     using EVT                   = cutlass::epilogue::threadblock::Sm80EVT<Store, ScaleW>;
     using GemmBase              = typename cutlass::gemm::kernel::DefaultGemmUniversal<int8_t, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 16, int8_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 16, float, cutlass::layout::RowMajor, int, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, Tile, Warp, cutlass::gemm::GemmShape<16, 8, 32>, cutlass::epilogue::thread::LinearCombination<float, 4, int, float>, Swizzle, 4, cutlass::arch::OpMultiplyAddSaturate, cutlass::gemm::SharedMemoryClearOption::kNone, false, false, false, cutlass::layout::NoPermute, cutlass::layout::NoPermute, ggml_cuda_i8_swiglu_weight_layout>::GemmKernel;
     using Epilogue              = cutlass::epilogue::threadblock::EpilogueWithVisitorCallbacks<typename GemmBase::Epilogue, EVT, 1>;
-    using Kernel                = cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmBase::Mma, Epilogue, Swizzle>;
+    using Kernel                = std::conditional_t<stream_k,
+                                                     cutlass::gemm::kernel::GemmWithEpilogueVisitorStreamk<typename GemmBase::Mma, Epilogue, Swizzle>,
+                                                     cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmBase::Mma, Epilogue, Swizzle>>;
     using Gemm                  = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
     typename EVT::Arguments evt = {{{{}, {xs, 0.f, {}}, {}}, {ws, 0.f, {}}, {}}, {out, {n, cute::_1{}, int64_t(rows) * n}}};
     typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {(int) rows, (int) n, (int) k}, 1, evt, x, w, nullptr, nullptr, int64_t(rows) * k, int64_t(n) * k, 0, 0, k, k, 0, 0);
@@ -281,7 +337,12 @@ static bool ggml_cuda_mul_mat_i8_swiglu_impl(
     if (sizeof(typename Kernel::SharedStorage) > ggml_cuda_info().devices[ctx.device].smpbo ||
         gemm.can_implement(args) != cutlass::Status::kSuccess)
         return false;
-    GGML_ASSERT(gemm.initialize(args, nullptr, stream) == cutlass::Status::kSuccess);
+    ggml_cuda_pool_alloc<char> workspace(ctx.pool());
+    const size_t workspace_size = gemm.get_workspace_size(args);
+    if (workspace_size > 0) {
+        workspace.alloc(workspace_size);
+    }
+    GGML_ASSERT(gemm.initialize(args, workspace.get(), stream) == cutlass::Status::kSuccess);
     GGML_ASSERT(gemm(stream) == cutlass::Status::kSuccess);
     return true;
 }
@@ -297,7 +358,7 @@ bool ggml_cuda_mul_mat_i8_swiglu_cutlass(
     int64_t k) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!ampere_mma_available(cc) ||
-        rows < 128 || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX || n % 256 != 0 || k % 64 != 0 || ws == nullptr ||
+        rows < (ggml_cuda_i8_small_rows_enabled(rows, n, k) ? 1 : 128) || rows > INT_MAX || n < 1 || n > INT_MAX || k < 1 || k > INT_MAX || n % 256 != 0 || k % 64 != 0 || ws == nullptr ||
         ((uintptr_t)x | (uintptr_t)w | (uintptr_t)xs | (uintptr_t)ws | (uintptr_t)out) % 16 != 0)
         return false;
     const cudaStream_t stream = ctx.stream();
@@ -305,7 +366,10 @@ bool ggml_cuda_mul_mat_i8_swiglu_cutlass(
     ggml_cuda_i8_pair_scales<<<(n + 255) / 256, 256, 0, stream>>>(ws, paired_scales.get(), (int) n);
     CUDA_CHECK(cudaGetLastError());
     return ggml_cuda_mul_mat_i8_dispatch(ctx, rows, n, [&](auto config) {
-        return ggml_cuda_mul_mat_i8_swiglu_impl<decltype(config)>(ctx, x, w, xs, paired_scales.get(), out, rows, n, k);
+        if (ggml_cuda_i8_use_streamk(rows)) {
+            return ggml_cuda_mul_mat_i8_swiglu_impl<decltype(config), true>(ctx, x, w, xs, paired_scales.get(), out, rows, n, k);
+        }
+        return ggml_cuda_mul_mat_i8_swiglu_impl<decltype(config), false>(ctx, x, w, xs, paired_scales.get(), out, rows, n, k);
     });
 }
 template <class Map, class Out, bool rms = true>
