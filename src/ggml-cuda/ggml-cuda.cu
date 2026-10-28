@@ -6350,6 +6350,13 @@ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+#ifdef _WIN32
+    // WDDM can retain another stream's uploads until the compute stream synchronizes.
+    const cudaError_t status = cudaEventQuery((cudaEvent_t)event->context);
+    if (status != cudaSuccess && status != cudaErrorNotReady) {
+        CUDA_CHECK(status);
+    }
+#endif
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
