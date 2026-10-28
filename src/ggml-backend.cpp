@@ -1928,7 +1928,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
+                    return GGML_STATUS_ABORTED;
                 }
 
                 j0 = j1;

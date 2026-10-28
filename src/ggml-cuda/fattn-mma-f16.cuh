@@ -36,6 +36,7 @@ struct fattn_mma_config {
     }                                                                                                                                                              \
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,128, 256, 1,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2, 128,  32,  32,  32, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 2, true);
@@ -2004,6 +2005,22 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
+static size_t ggml_cuda_fattn_mma_shared_size(
+        int DKQ, int DV, int ncols1, int ncols2, int cc, int warp_size) {
+    const int ncols = ncols1 * ncols2;
+    const auto config = ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc);
+    const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
+    const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
+    const int stride_K = config.nbatch_K2 + (swz ? 0 : 4);
+    const int stride_V = DKQ == 576 ? stride_K : config.nbatch_V2 + (swz ? 0 : 4);
+    const size_t kv = config.nbatch_fa * (nstages <= 1 ? std::max(stride_K, stride_V) : stride_K + stride_V) * sizeof(half2);
+    const size_t q = ncols * (DKQ / 2 + 4) * sizeof(half2);
+    const size_t mask = ncols1 * (config.nbatch_fa / 2 + 4) * sizeof(half2);
+    const size_t combine = (config.nthreads / warp_size) * std::min(ncols, get_cols_per_warp(cc)) *
+        (config.nbatch_combine + 4) * sizeof(half2);
+    return std::max(combine, config.Q_in_reg ? std::max(q, kv + mask) : q + kv + mask);
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -2012,35 +2029,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr int ncols = ncols1 * ncols2;
 
-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
-    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
-    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
-    const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
-
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+    const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
+    const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
+    const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int nwarps         = nthreads / warp_size_host;
-
+    const int nwarps = nthreads / warp_size_host;
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
-
-    // KV tile strides must match flash_attn_ext_f16_iter / _process_tile.
-    const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
-    const int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
-    const int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
-    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
-    const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
-    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
-
-    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
-
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+    const size_t nbytes_shared_total = ggml_cuda_fattn_mma_shared_size(DKQ, DV, ncols1, ncols2, cc, warp_size_host);
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -2144,6 +2139,10 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  96,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112, 112,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256, 256,  64)
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+extern DECL_FATTN_MMA_F16_CASE(128, 128, 128, 1);
+#endif
 
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  2);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  2);
