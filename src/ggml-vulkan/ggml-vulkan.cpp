@@ -11466,6 +11466,7 @@ static void ggml_vk_rope_apply(ggml_backend_vk_context * ctx, vk_context & subct
 
     vk_op_rope_apply_push_constants pc {};
     pc.half_dim = x->ne[0]/2;
+    pc.rot_half = pe->ne[2];
     pc.heads    = x->ne[1];
     pc.tokens   = x->ne[2];
     pc.pairs    = ggml_nelements(x)/2;
@@ -15992,7 +15993,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_ROPE_APPLY:
             if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
-                op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
+                op->src[1]->ne[2] <= 0 || op->src[1]->ne[2] > op->src[0]->ne[0] / 2) {
                 return false;
             }
             // The shader uses 32-bit element indices, including descriptor alignment offsets.

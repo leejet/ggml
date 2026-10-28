@@ -8,6 +8,7 @@ layout(binding = 2) writeonly buffer D { float data_d[]; };
 
 layout(push_constant) uniform parameter {
     uint half_dim;
+    uint rot_half;
     uint heads;
     uint tokens;
     uint pairs;
@@ -29,13 +30,18 @@ void main() {
     const uint token = row % pc.tokens;
     const uint head  = (row / pc.tokens) % pc.heads;
     const uint batch = row / (pc.tokens*pc.heads);
-    const uint i0    = pc.interleaved != 0 ? 2*j : j;
-    const uint i1    = pc.interleaved != 0 ? 2*j + 1 : j + pc.half_dim;
+    const uint i0    = pc.interleaved != 0 || j >= pc.rot_half ? 2*j : j;
+    const uint i1    = pc.interleaved != 0 || j >= pc.rot_half ? 2*j + 1 : j + pc.rot_half;
     const uint x_row = pc.x_offset + head*pc.x_stride[1] + token*pc.x_stride[2] + batch*pc.x_stride[3];
-    const uint matrix = pc.pe_offset + j*pc.pe_stride[2] + token*pc.pe_stride[3];
     const uint out_row = pc.dst_offset + row*pc.half_dim*2;
     const float a = data_x[x_row + i0*pc.x_stride[0]];
     const float b = data_x[x_row + i1*pc.x_stride[0]];
+    if (j >= pc.rot_half) {
+        data_d[out_row + i0] = a;
+        data_d[out_row + i1] = b;
+        return;
+    }
+    const uint matrix = pc.pe_offset + j*pc.pe_stride[2] + token*pc.pe_stride[3];
     const float c = data_pe[matrix];
     const float s = data_pe[matrix + pc.pe_stride[1]];
     // Preserve the separate multiply/add rounding of the unfused graph.

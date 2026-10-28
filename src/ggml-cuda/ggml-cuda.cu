@@ -4799,9 +4799,9 @@ static bool ggml_cuda_can_fuse_rms_norm_mul_rope_apply(const ggml_cgraph * cgrap
         x->ne[0] >= 32 && x->ne[0] <= 256 && x->ne[0] % 32 == 0 && x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 &&
         norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && rope->type == GGML_TYPE_F32 &&
         pe->type == GGML_TYPE_F32 && ggml_nelements(weight) == x->ne[0] && weight->ne[0] == x->ne[0] &&
-        pe->ne[0] == 2 && pe->ne[1] == 2 && pe->ne[2] == x->ne[0] / 2 && pe->ne[3] == x->ne[2] &&
+        pe->ne[0] == 2 && pe->ne[1] == 2 && pe->ne[2] <= x->ne[0] / 2 && pe->ne[3] == x->ne[2] &&
         (uintptr_t) pe->data % alignof(float4) == 0 &&
-        ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(pe) && ggml_is_contiguous(rope);
+        x->nb[0] == sizeof(float) && ggml_is_contiguous(weight) && ggml_is_contiguous(pe) && ggml_is_contiguous(rope);
 }
 
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
@@ -4819,6 +4819,7 @@ static bool ggml_cuda_can_fuse_i8_rms_rope(const ggml_cgraph * cgraph, int i, in
     const ggml_tensor * view = cgraph->nodes[i + 1];
     const ggml_tensor * norm = cgraph->nodes[i + 2];
     return view->src[0] == mat && view->view_offs == 0 && norm->src[0] == view &&
+        cgraph->nodes[i + 4]->src[1]->ne[2] == view->ne[0] / 2 &&
         view->ne[0] == 128 && ggml_get_op_params_i32(cgraph->nodes[i + 4], 0) == 1 &&
         ggml_nelements(mat) == ggml_nelements(view) && view->ne[0] * view->ne[1] == mat->ne[0] &&
         mat->type == GGML_TYPE_F32 && mat->src[2]->type == GGML_TYPE_F32 &&

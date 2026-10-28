@@ -6295,7 +6295,7 @@ void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_te
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     const bool interleaved = ggml_get_op_params_i32(dst, 0) != 0;
-    const int64_t half_dim = x->ne[0]/2;
+    const int64_t half_dim = pe->ne[2];
     const int64_t rows = x->ne[1]*x->ne[2]*x->ne[3];
     const int64_t rows_per_thread = (rows + params->nth - 1)/params->nth;
     const int64_t begin = rows_per_thread*params->ith;
@@ -6324,6 +6324,9 @@ void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_te
                 out[i0] = a*c - b*s;
                 out[i1] = a*s + b*c;
             }
+        }
+        for (int64_t col = 2*half_dim; col < x->ne[0]; ++col) {
+            out[col] = *(const float *) (x_row + col*x->nb[0]);
         }
     }
 }
