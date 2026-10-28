@@ -4851,7 +4851,8 @@ static bool ggml_cuda_can_fuse_cont_scale_permute_cast(const ggml_cgraph * cgrap
     const ggml_tensor * scale = cgraph->nodes[i + 1];
     const ggml_tensor * permute = cgraph->nodes[i + 2];
     const ggml_tensor * cast = cgraph->nodes[i + 3];
-    return src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) && src->ne[0] % 4 == 0 &&
+    return ggml_are_same_shape(src, cont) &&
+        src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) && src->ne[0] % 4 == 0 &&
         ((uintptr_t) src->data | src->nb[1] | src->nb[2] | src->nb[3]) % alignof(float4) == 0 &&
         scale->src[0] == cont && permute->src[0] == scale && cast->src[0] == permute &&
         scale->type == GGML_TYPE_F32 && cast->type == GGML_TYPE_F16 &&
