@@ -4973,6 +4973,44 @@ static bool ggml_cuda_can_fuse_unary_mul_convrot(const ggml_cgraph * cgraph, int
         size_t(mul->ne[0]) * sizeof(float) + 128 <= ggml_cuda_info().devices[device].smpbo;
 }
 
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+static bool ggml_cuda_can_fuse_i8_swiglu(const ggml_cgraph * graph, int i, int device) {
+    if (i + 1 >= graph->n_nodes || !ampere_mma_available(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    const ggml_tensor * mat = graph->nodes[i];
+    const ggml_tensor * glu = graph->nodes[i + 1];
+    return mat->op == GGML_OP_MUL_MAT && ggml_mul_mat_has_packed_i8_input(mat) &&
+        mat->type == GGML_TYPE_F32 && mat->view_src == nullptr &&
+        mat->ne[2] == 1 && mat->ne[3] == 1 && ggml_nrows(mat) > 0 && ggml_nrows(mat) <= INT_MAX &&
+        mat->src[0]->ne[2] == 1 && mat->src[0]->ne[3] == 1 && ggml_is_contiguous(mat->src[0]) &&
+        mat->src[0]->ne[0] % 64 == 0 && mat->src[0]->ne[0] <= INT_MAX &&
+        mat->ne[0] % 256 == 0 && mat->ne[0] <= INT_MAX &&
+        mat->src[2] != nullptr && mat->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(mat->src[2]) &&
+        ggml_nelements(mat->src[2]) == mat->ne[0] && mat->src[3] == nullptr &&
+        glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+        ggml_get_op_params_i32(glu, 1) == 0 && glu->src[0] == mat && glu->src[1] == nullptr &&
+        ggml_is_contiguous(mat) && ggml_is_contiguous(glu) &&
+        ggml_can_fuse_subgraph(graph, i, {GGML_OP_MUL_MAT, GGML_OP_GLU}, {i + 1});
+}
+
+static bool ggml_cuda_try_fuse_i8_swiglu(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (!ggml_cuda_can_fuse_i8_swiglu(graph, i, ctx.device)) {
+        return false;
+    }
+    ggml_tensor * mat = graph->nodes[i];
+    ggml_tensor * glu = graph->nodes[i + 1];
+    const int output_idx = i + 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(graph, i, 2, &output_idx, 1)) {
+        return false;
+    }
+    return ggml_cuda_mul_mat_i8_swiglu_cutlass(ctx, (const int8_t *) mat->src[1]->data,
+        (const int8_t *) mat->src[0]->data, ggml_mul_mat_i8_input_scales(mat),
+        (const float *) mat->src[2]->data, (float *) glu->data,
+        ggml_nrows(mat), mat->ne[0], mat->src[0]->ne[0]);
+}
+#endif
+
 static bool ggml_cuda_can_fuse_i8_swiglu_convrot(const ggml_cgraph * cgraph, int i, int device) {
     const ggml_tensor * node = cgraph->nodes[i];
     if (node->op != GGML_OP_MUL_MAT || node->src[0]->type != GGML_TYPE_I8 ||
@@ -5175,6 +5213,63 @@ static int ggml_cuda_try_fuse_fattn(ggml_backend_cuda_context & ctx, ggml_cgraph
 #endif
 
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+static bool ggml_cuda_can_fuse_i8_row_concat(const ggml_cgraph * graph, int i) {
+    if (i + 1 >= graph->n_nodes) return false;
+    const ggml_tensor * mat = graph->nodes[i];
+    const ggml_tensor * concat = graph->nodes[i + 1];
+    return mat->op == GGML_OP_MUL_MAT && mat->src[0]->type == GGML_TYPE_I8 &&
+        mat->src[1]->type == GGML_TYPE_I8 && mat->src[2] != nullptr && mat->src[3] == nullptr &&
+        concat->op == GGML_OP_CONCAT && concat->src[1] == mat && ggml_get_op_params_i32(concat, 0) == 1 &&
+        mat->type == GGML_TYPE_F32 && concat->type == GGML_TYPE_F32 &&
+        mat->ne[2] == 1 && mat->ne[3] == 1 && concat->ne[2] == 1 && concat->ne[3] == 1 &&
+        ggml_is_contiguous(mat) && ggml_is_contiguous(concat) && ggml_is_contiguous(concat->src[0]) &&
+        ggml_can_fuse_subgraph(graph, i, { GGML_OP_MUL_MAT, GGML_OP_CONCAT }, { i + 1 });
+}
+
+static bool ggml_cuda_can_fuse_i8_gated_concat(const ggml_cgraph * graph, int i) {
+    if (i + 3 >= graph->n_nodes || ggml_cuda_can_fuse_i8_gated_residual(graph, i) != 3) return false;
+    const ggml_tensor * concat = graph->nodes[i + 3];
+    return concat->op == GGML_OP_CONCAT && concat->src[1] == graph->nodes[i + 2] &&
+        ggml_get_op_params_i32(concat, 0) == 1 && concat->type == GGML_TYPE_F32 &&
+        concat->ne[2] == 1 && concat->ne[3] == 1 && ggml_is_contiguous(concat) && ggml_is_contiguous(concat->src[0]) &&
+        ggml_can_fuse_subgraph(graph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_CONCAT }, { i + 3 });
+}
+
+static bool ggml_cuda_try_fuse_i8_gated_concat(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (!ggml_cuda_can_fuse_i8_gated_concat(graph, i)) return false;
+    const int output_idx = i + 3;
+    if (!ggml_cuda_check_fusion_memory_ranges(graph, i, 4, &output_idx, 1)) return false;
+    const ggml_tensor * mat = graph->nodes[i];
+    const ggml_tensor * mul = graph->nodes[i + 1];
+    const ggml_tensor * add = graph->nodes[i + 2];
+    const ggml_tensor * residual = add->src[0] == mul ? add->src[1] : add->src[0];
+    ggml_tensor * concat = graph->nodes[i + 3];
+    const size_t prefix_bytes = ggml_nbytes(concat->src[0]);
+    const int64_t k = mat->src[0]->ne[0], rows = ggml_nrows(mat);
+    const int8_t * packed = (const int8_t *) mat->src[1]->data;
+    if (!ggml_cuda_mul_mat_i8_cutlass_residual(ctx, packed, (const int8_t *) mat->src[0]->data,
+        ggml_mul_mat_i8_input_scales(mat), (const float *) mat->src[2]->data,
+        (float *) ((char *) concat->data + prefix_bytes), rows, mat->ne[0], k,
+        (const float *) mul->src[1]->data, (const float *) residual->data, 1.0f)) return false;
+    CUDA_CHECK(cudaMemcpyAsync(concat->data, concat->src[0]->data, prefix_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+    return true;
+}
+
+static bool ggml_cuda_try_fuse_i8_row_concat(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (!ggml_cuda_can_fuse_i8_row_concat(graph, i)) return false;
+    const int output_idx = i + 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(graph, i, 2, &output_idx, 1)) return false;
+    const ggml_tensor * mat = graph->nodes[i];
+    ggml_tensor * concat = graph->nodes[i + 1];
+    ggml_tensor output = *mat;
+    const size_t prefix_bytes = ggml_nbytes(concat->src[0]);
+    output.data = (char *) concat->data + prefix_bytes;
+    output.buffer = concat->buffer;
+    ggml_cuda_mul_mat_i8(ctx, mat->src[0], mat->src[1], &output);
+    CUDA_CHECK(cudaMemcpyAsync(concat->data, concat->src[0]->data, prefix_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+    return true;
+}
+
 static int ggml_cuda_try_fuse_i8_kv_concat(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     const int count = ggml_cuda_can_fuse_i8_kv_concat(cgraph, i, ctx.device);
     if (count == 0) {
@@ -5272,6 +5367,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+    if (ggml_cuda_try_fuse_i8_gated_concat(*cuda_ctx, cgraph, i)) {
+        return 3;
+    }
+    if (ggml_cuda_try_fuse_i8_row_concat(*cuda_ctx, cgraph, i)) {
+        return 1;
+    }
     if (const int skip = ggml_cuda_try_fuse_i8_kv_concat(*cuda_ctx, cgraph, i)) {
         return skip;
     }
@@ -5440,6 +5541,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 #if !defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+    if (ggml_cuda_try_fuse_i8_swiglu(*cuda_ctx, cgraph, i)) {
+        return 1;
+    }
+#endif
     if (ggml_cuda_can_fuse_i8_swiglu_convrot(cgraph, i, cuda_ctx->device)) {
         ggml_cuda_mul_mat_i8(*cuda_ctx, node->src[0], node->src[1], node, cgraph->nodes[i + 2]);
         return 2;
@@ -6813,6 +6919,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
 #endif
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+            if (ggml_cuda_can_fuse_i8_gated_concat(cgraph, i)) {
+                add_alloc_deps(i, i + 3);
+            }
+            if (ggml_cuda_can_fuse_i8_row_concat(cgraph, i)) {
+                add_alloc_deps(i, i + 1);
+            }
             if (const int count = ggml_cuda_can_fuse_i8_kv_concat(cgraph, i, cuda_ctx->device)) {
                 add_alloc_deps(i, i + count - 1);
             }
@@ -6830,6 +6942,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
 #endif
 #if !defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
+            if (ggml_cuda_can_fuse_i8_swiglu(cgraph, i, cuda_ctx->device)) {
+                add_alloc_deps(i, i + 1);
+                continue;
+            }
+#endif
             if (ggml_cuda_can_fuse_i8_swiglu_convrot(cgraph, i, cuda_ctx->device)) {
                 add_alloc_deps(i, i + 2);
             }
