@@ -20,9 +20,10 @@ static __global__ void rms_norm_mul_rope_apply_128(const float *    x,
                                                    RopeApplyStrides strides,
                                                    float            eps) {
     ggml_cuda_pdl_lc();
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    const int     work      = blockIdx.x * 4 + threadIdx.x / warp_size;
-    const int     lane      = threadIdx.x % warp_size;
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int values_per_lane = GGML_CUDA_ROPE_APPLY_HEAD_SIZE / warp_size;
+    const int     work            = blockIdx.x * GGML_CUDA_ROPE_APPLY_WARPS_PER_BLOCK + threadIdx.x / warp_size;
+    const int     lane            = threadIdx.x % warp_size;
     if (work >= total_rows) {
         return;
     }
@@ -33,37 +34,36 @@ static __global__ void rms_norm_mul_rope_apply_128(const float *    x,
     const int row   = (batch * heads + head) * tokens + token;
     ggml_cuda_pdl_sync();
     const float * input = x + head * strides.x[1] + token * strides.x[2] + batch * strides.x[3];
-    float         values[4], sums[4];
-#    pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    float         values[values_per_lane], sums[values_per_lane];
+#pragma unroll
+    for (int i = 0; i < values_per_lane; ++i) {
         values[i] = input[lane + warp_size * i];
         sums[i]   = warp_reduce_sum(__fmul_rn(values[i], values[i]));
     }
     // Keep the original 256-thread RMS reduction and the separate mul/add rounding.
     const float sum   = __fadd_rn(__fadd_rn(sums[0], sums[2]), __fadd_rn(sums[1], sums[3]));
-    const float scale = rsqrtf(sum / 128 + eps);
-#    pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    const float scale = rsqrtf(sum / GGML_CUDA_ROPE_APPLY_HEAD_SIZE + eps);
+#pragma unroll
+    for (int i = 0; i < values_per_lane; ++i) {
         values[i] = __fmul_rn(__fmul_rn(scale, values[i]), weight[lane + warp_size * i]);
     }
-#    pragma unroll
+#pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const int     j                  = lane + warp_size * i;
-        const float * matrix             = pe + j * strides.pe[2] + token * strides.pe[3];
-        const float   c                  = matrix[0];
-        const float   s                  = matrix[strides.pe[1]];
-        const float   a                  = values[i];
-        const float   b                  = values[i + 2];
-        dst[int64_t(row) * 128 + j]      = ggml_cuda_cast<dst_t>(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
-        dst[int64_t(row) * 128 + j + 64] = ggml_cuda_cast<dst_t>(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
+        const int     j      = lane + warp_size * i;
+        const float * matrix = pe + j * strides.pe[2] + token * strides.pe[3];
+        const float   c      = matrix[0];
+        const float   s      = matrix[strides.pe[1]];
+        const float   a      = values[i];
+        const float   b      = values[i + 2];
+        dst[int64_t(row) * GGML_CUDA_ROPE_APPLY_HEAD_SIZE + j] =
+            ggml_cuda_cast<dst_t>(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
+        dst[int64_t(row) * GGML_CUDA_ROPE_APPLY_HEAD_SIZE + j + GGML_CUDA_ROPE_APPLY_HEAD_SIZE / 2] =
+            ggml_cuda_cast<dst_t>(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
     }
 }
 
-void ggml_cuda_op_rms_norm_mul_rope_apply(ggml_backend_cuda_context & ctx,
-                                          ggml_tensor *               norm,
-                                          ggml_tensor *               mul,
-                                          ggml_tensor *               rope,
-                                          ggml_tensor *               dst) {
+void ggml_cuda_op_rms_norm_mul_rope_apply(
+    ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * dst) {
     const ggml_tensor * x      = norm->src[0];
     const ggml_tensor * weight = mul->src[1];
     const ggml_tensor * pe     = rope->src[1];
@@ -72,17 +72,20 @@ void ggml_cuda_op_rms_norm_mul_rope_apply(ggml_backend_cuda_context & ctx,
         strides.x[i]  = x->nb[i] / sizeof(float);
         strides.pe[i] = pe->nb[i] / sizeof(float);
     }
-    const int                            rows          = int(ggml_nelements(x) / 128);
-    const ggml_cuda_kernel_launch_params launch_params = { dim3((rows + 3) / 4), dim3(128), 0, ctx.stream() };
+    const int                            rows          = int(ggml_nelements(x) / GGML_CUDA_ROPE_APPLY_HEAD_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params = {
+        dim3((rows + GGML_CUDA_ROPE_APPLY_WARPS_PER_BLOCK - 1) / GGML_CUDA_ROPE_APPLY_WARPS_PER_BLOCK),
+        dim3(GGML_CUDA_ROPE_APPLY_WARPS_PER_BLOCK * WARP_SIZE), 0, ctx.stream()
+    };
     if (dst->type == GGML_TYPE_F16) {
-        ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128<half>, launch_params, (const float *) x->data,
-                                (const float *) weight->data, (const float *) pe->data, (half *) dst->data,
-                                int(x->ne[1]), int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128<half>, launch_params, (const float *)x->data,
+                                (const float *)weight->data, (const float *)pe->data, (half *)dst->data, int(x->ne[1]),
+                                int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
     } else {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
-        ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128<float>, launch_params, (const float *) x->data,
-                                (const float *) weight->data, (const float *) pe->data, (float *) dst->data,
-                                int(x->ne[1]), int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_apply_128<float>, launch_params, (const float *)x->data,
+                                (const float *)weight->data, (const float *)pe->data, (float *)dst->data, int(x->ne[1]),
+                                int(x->ne[2]), rows, strides, ggml_get_op_params_f32(norm, 0));
     }
 }
 #endif
@@ -96,25 +99,25 @@ static __global__ void rope_apply_f32(const float *    x,
                                       int64_t          tokens,
                                       int64_t          pairs,
                                       RopeApplyStrides strides) {
-    const int64_t index = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= pairs) {
         return;
     }
-    const int64_t j     = index % half_dim;
+    const int64_t j      = index % half_dim;
     const int64_t work   = index / half_dim;
     const int64_t token  = heads_first ? work / heads % tokens : work % tokens;
     const int64_t head   = heads_first ? work % heads : work / tokens % heads;
     const int64_t batch  = work / (tokens * heads);
     const int64_t row    = heads_first ? (batch * heads + head) * tokens + token : work;
-    const int64_t i0    = interleaved ? 2*j : j;
-    const int64_t i1    = interleaved ? 2*j + 1 : j + half_dim;
-    const float * x_row = x + head*strides.x[1] + token*strides.x[2] + batch*strides.x[3];
-    const float * matrix = pe + j*strides.pe[2] + token*strides.pe[3];
-    const float a = x_row[i0*strides.x[0]];
-    const float b = x_row[i1*strides.x[0]];
-    const float c = matrix[0];
-    const float s = matrix[strides.pe[1]];
-    float * out = dst + row*half_dim*2;
+    const int64_t i0     = interleaved ? 2 * j : j;
+    const int64_t i1     = interleaved ? 2 * j + 1 : j + half_dim;
+    const float * x_row  = x + head * strides.x[1] + token * strides.x[2] + batch * strides.x[3];
+    const float * matrix = pe + j * strides.pe[2] + token * strides.pe[3];
+    const float   a      = x_row[i0 * strides.x[0]];
+    const float   b      = x_row[i1 * strides.x[0]];
+    const float   c      = matrix[0];
+    const float   s      = matrix[strides.pe[1]];
+    float *       out    = dst + row * half_dim * 2;
     // Match the separate mul/add rounding of the unfused graph.
     if (interleaved) {
         out[i0] = __fadd_rn(__fmul_rn(a, c), __fmul_rn(b, matrix[strides.pe[0]]));
@@ -125,6 +128,21 @@ static __global__ void rope_apply_f32(const float *    x,
     }
 }
 
+static bool ggml_cuda_should_use_rope_apply_heads_first(const ggml_backend_cuda_context & ctx,
+                                                        const ggml_tensor *               dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    // Scheduling supports other widths and modes; enable only the configuration measured on SM86.
+    const bool tuned = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_AMPERE_GA10X && x->ne[0] == 128 &&
+                       ggml_get_op_params_i32(dst, 0) == 0;
+    const uintptr_t output_begin = reinterpret_cast<uintptr_t>(dst->data);
+    const uintptr_t input_begin  = reinterpret_cast<uintptr_t>(x->data);
+    const uintptr_t pe_begin     = reinterpret_cast<uintptr_t>(pe->data);
+    return tuned && x->ne[1] > 1 && x->nb[1] < x->nb[2] &&
+           (output_begin >= input_begin + ggml_nbytes(x) || input_begin >= output_begin + ggml_nbytes(dst)) &&
+           (output_begin >= pe_begin + ggml_nbytes(pe) || pe_begin >= output_begin + ggml_nbytes(dst));
+}
+
 void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x  = dst->src[0];
     const ggml_tensor * pe = dst->src[1];
@@ -132,40 +150,29 @@ void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT(ggml_is_contiguous(dst));
     RopeApplyStrides strides;
     for (int i = 0; i < 4; ++i) {
-        strides.x[i]  = x->nb[i]/sizeof(float);
-        strides.pe[i] = pe->nb[i]/sizeof(float);
+        strides.x[i]  = x->nb[i] / sizeof(float);
+        strides.pe[i] = pe->nb[i] / sizeof(float);
     }
-    const int64_t pairs = ggml_nelements(x)/2;
-    const dim3 blocks((pairs + CUDA_ROPE_BLOCK_SIZE - 1)/CUDA_ROPE_BLOCK_SIZE);
-    const dim3 threads(CUDA_ROPE_BLOCK_SIZE);
-    const ggml_cuda_kernel_launch_params launch_params = {blocks, threads, 0, ctx.stream()};
-    const uintptr_t                      output_begin  = reinterpret_cast<uintptr_t>(dst->data);
-    const uintptr_t                      input_begin   = reinterpret_cast<uintptr_t>(x->data);
-    const uintptr_t                      pe_begin      = reinterpret_cast<uintptr_t>(pe->data);
-    const bool                           heads_first =
-        !ggml_get_op_params_i32(dst, 0) && x->ne[0] == 128 && x->ne[1] > 1 && x->nb[1] < x->nb[2] &&
-        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_AMPERE_GA10X &&
-        (output_begin >= input_begin + ggml_nbytes(x) || input_begin >= output_begin + ggml_nbytes(dst)) &&
-        (output_begin >= pe_begin + ggml_nbytes(pe) || pe_begin >= output_begin + ggml_nbytes(dst));
-    if (heads_first) {
-        ggml_cuda_kernel_launch(rope_apply_f32<false, true>, launch_params, (const float *) x->data,
-                                (const float *) pe->data, (float *) dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs,
+    const int64_t                        pairs = ggml_nelements(x) / 2;
+    const dim3                           blocks((pairs + CUDA_ROPE_BLOCK_SIZE - 1) / CUDA_ROPE_BLOCK_SIZE);
+    const dim3                           threads(CUDA_ROPE_BLOCK_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params = { blocks, threads, 0, ctx.stream() };
+    if (ggml_cuda_should_use_rope_apply_heads_first(ctx, dst)) {
+        ggml_cuda_kernel_launch(rope_apply_f32<false, true>, launch_params, (const float *)x->data,
+                                (const float *)pe->data, (float *)dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs,
                                 strides);
     } else if (ggml_get_op_params_i32(dst, 0)) {
-        ggml_cuda_kernel_launch(rope_apply_f32<true>, launch_params,
-            (const float *) x->data, (const float *) pe->data, (float *) dst->data,
-            x->ne[0]/2, x->ne[1], x->ne[2], pairs, strides);
+        ggml_cuda_kernel_launch(rope_apply_f32<true>, launch_params, (const float *)x->data, (const float *)pe->data,
+                                (float *)dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs, strides);
     } else {
-        ggml_cuda_kernel_launch(rope_apply_f32<false>, launch_params,
-            (const float *) x->data, (const float *) pe->data, (float *) dst->data,
-            x->ne[0]/2, x->ne[1], x->ne[2], pairs, strides);
+        ggml_cuda_kernel_launch(rope_apply_f32<false>, launch_params, (const float *)x->data, (const float *)pe->data,
+                                (float *)dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs, strides);
     }
 }
 
 struct rope_corr_dims {
     float v[2];
 };
-
 
 struct mrope_sections {
     int v[4];
