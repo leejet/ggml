@@ -186,6 +186,9 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
+static bool ggml_cuda_reuse_buffers_enabled(int device);
+static void ggml_cuda_clear_reusable_buffers(int device);
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -212,6 +215,11 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
+        if (err == cudaErrorMemoryAllocation && ggml_cuda_reuse_buffers_enabled(device)) {
+            (void)cudaGetLastError();
+            ggml_cuda_clear_reusable_buffers(device);
+            err = cudaMalloc(ptr, size);
+        }
     }
     return err;
 }
@@ -628,7 +636,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            auto allocation_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (allocation_result == CUDA_ERROR_OUT_OF_MEMORY && ggml_cuda_reuse_buffers_enabled(device)) {
+                ggml_cuda_clear_reusable_buffers(device);
+                allocation_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            }
+            CU_CHECK(allocation_result);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -771,6 +784,79 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+struct ggml_cuda_reusable_buffers {
+    struct entry { void * ptr; size_t size; };
+    static constexpr size_t limit = 4ULL * 1024 * 1024 * 1024;
+    std::mutex mutex;
+    std::vector<entry> entries;
+    size_t bytes = 0;
+    int physical_device = -1;
+    bool enabled = false;
+    ~ggml_cuda_reusable_buffers() {
+        if (physical_device >= 0 && cudaSetDevice(physical_device) == cudaSuccess) {
+            for (const auto & entry : entries) cudaFree(entry.ptr);
+        }
+    }
+    void clear() {
+        for (const auto & entry : entries) CUDA_CHECK(cudaFree(entry.ptr));
+        entries.clear();
+        bytes = 0;
+    }
+};
+static ggml_cuda_reusable_buffers & ggml_cuda_reusable_buffer_pool(int device) {
+    static ggml_cuda_reusable_buffers pools[GGML_CUDA_MAX_DEVICES];
+    return pools[device];
+}
+static bool ggml_cuda_reuse_buffers_enabled(int device) {
+    auto & pool = ggml_cuda_reusable_buffer_pool(device);
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    return pool.enabled;
+}
+static void * ggml_cuda_take_reusable_buffer(int device, size_t size) {
+    auto & pool = ggml_cuda_reusable_buffer_pool(device);
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    if (!pool.enabled) {
+        return nullptr;
+    }
+    pool.physical_device = ggml_cuda_get_physical_device(device);
+    for (auto it = pool.entries.begin(); it != pool.entries.end(); ++it) {
+        if (it->size == size) {
+            void * ptr = it->ptr;
+            pool.bytes -= it->size;
+            pool.entries.erase(it);
+            return ptr;
+        }
+    }
+    size_t free_bytes, total_bytes;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (size > free_bytes || free_bytes - size < 256ULL * 1024 * 1024) pool.clear();
+    return nullptr;
+}
+static void ggml_cuda_clear_reusable_buffers(int device) {
+    ggml_cuda_set_device(device);
+    auto & pool = ggml_cuda_reusable_buffer_pool(device);
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    pool.clear();
+}
+static void ggml_cuda_return_reusable_buffer(int device, void * ptr, size_t size) {
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto & pool = ggml_cuda_reusable_buffer_pool(device);
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    // Buffers allocated while enabled may be returned after the cache is disabled.
+    if (!pool.enabled) {
+        CUDA_CHECK(cudaFree(ptr));
+        return;
+    }
+    while (!pool.entries.empty() && pool.bytes + size > pool.limit) {
+        CUDA_CHECK(cudaFree(pool.entries.front().ptr));
+        pool.bytes -= pool.entries.front().size;
+        pool.entries.erase(pool.entries.begin());
+    }
+    pool.entries.push_back({ptr, size});
+    pool.bytes += size;
+}
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
@@ -781,7 +867,12 @@ struct ggml_backend_cuda_buffer_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    size_t reusable_size = 0;
     ~ggml_backend_cuda_buffer_context() {
+        if (reusable_size != 0) {
+            ggml_cuda_return_reusable_buffer(device, dev_ptr, reusable_size);
+            return;
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -934,8 +1025,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_cuda_set_device(buft_ctx->device);
 
-    void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    void * dev_ptr = nullptr;
+    const bool reusable = size > 0 && size <= ggml_cuda_reusable_buffers::limit && ggml_cuda_reuse_buffers_enabled(buft_ctx->device);
+    if (size > 0 && ggml_cuda_reuse_buffers_enabled(buft_ctx->device)) dev_ptr = ggml_cuda_take_reusable_buffer(buft_ctx->device, size);
+    cudaError_t err = dev_ptr != nullptr ? cudaSuccess : ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -944,6 +1037,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    if (reusable) ctx->reusable_size = size;
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -3416,8 +3510,29 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_clear_reusable_buffers(cuda_ctx->device);
     delete cuda_ctx;
     delete backend;
+}
+
+void ggml_backend_cuda_set_buffer_cache_enabled(ggml_backend_t backend, bool enabled) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    auto & pool = ggml_cuda_reusable_buffer_pool(ctx->device);
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    const char * setting = std::getenv("GGML_CUDA_REUSE_BUFFERS");
+    pool.enabled = enabled && (setting == nullptr || std::atoi(setting) != 0) && !ggml_cuda_unified_memory_enabled();
+    if (!pool.enabled) {
+        pool.clear();
+    }
+}
+
+void ggml_backend_cuda_clear_buffer_cache(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_clear_reusable_buffers(ctx->device);
 }
 
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -7149,6 +7264,12 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     }
 #endif // defined(__linux__) && !defined(GGML_USE_HIP)
 
+    if (*free < *total && ggml_cuda_reuse_buffers_enabled(ctx->device)) {
+        auto & pool = ggml_cuda_reusable_buffer_pool(ctx->device);
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        *free += std::min(pool.bytes, *total - *free);
+    }
+
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
     *free  /= share_count;
@@ -7905,6 +8026,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_set_buffer_cache_enabled") == 0) {
+        return (void *) ggml_backend_cuda_set_buffer_cache_enabled;
+    }
+    if (strcmp(name, "ggml_backend_clear_buffer_cache") == 0) {
+        return (void *) ggml_backend_cuda_clear_buffer_cache;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
