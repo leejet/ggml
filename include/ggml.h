@@ -1870,10 +1870,11 @@ extern "C" {
             float                 max_bias);
 
     // Apply precomputed rotary matrices, with shapes in ne[] order:
-    // a: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, head_dim/2, tokens].
+    // a: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, rot_dim/2, tokens].
     // pe stores [[cos, -sin], [sin, cos]] for each pair and token, shared across heads/batches.
     // Returns contiguous F32 [head_dim, tokens, heads*batch]. Input strides are preserved.
-    // Interleaved pairs are (2*i, 2*i+1); otherwise pairs are (i, i+head_dim/2).
+    // Interleaved pairs are (2*i, 2*i+1); otherwise pairs are (i, i+rot_dim/2).
+    // Channels from rot_dim to head_dim are copied unchanged.
     GGML_API struct ggml_tensor * ggml_rope_apply(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

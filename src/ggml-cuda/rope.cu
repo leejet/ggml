@@ -6,16 +6,21 @@
 template <int D, bool interleaved, typename T>
 static __global__ void rms_norm_mul_rope_apply_fused(
         const float * x, const float * weight, const float * pe, T * dst,
-        int64_t heads, int64_t tokens, int64_t rows, float eps, float output_scale) {
+        int64_t heads, int64_t tokens, int64_t rows, int64_t nb1, int64_t nb2, int64_t nb3,
+        int rot_half, float eps, float output_scale) {
     const int lane = threadIdx.x;
     const int64_t row = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
     if (row >= rows) {
         return;
     }
+    const int64_t head = row % heads;
+    const int64_t token = (row / heads) % tokens;
+    const int64_t batch = row / (heads * tokens);
+    const float * x_row = x + head*nb1 + token*nb2 + batch*nb3;
     float v[D / 32], sums[8] = {};
 #pragma unroll
     for (int j = 0; j < D / 32; ++j) {
-        v[j] = x[row * D + j * 32 + lane];
+        v[j] = x_row[j * 32 + lane];
         sums[j] = warp_reduce_sum<32>(__fmul_rn(v[j], v[j]));
     }
     // Preserve the 256-thread RMSNorm kernel's reduction tree, including inactive warps.
@@ -23,28 +28,29 @@ static __global__ void rms_norm_mul_rope_apply_fused(
         __fadd_rn(__fadd_rn(sums[0], sums[4]), __fadd_rn(sums[2], sums[6])),
         __fadd_rn(__fadd_rn(sums[1], sums[5]), __fadd_rn(sums[3], sums[7])));
     const float scale = rsqrtf(sum / float(D) + eps);
-    const int64_t head = row % heads;
-    const int64_t token = (row / heads) % tokens;
-    const int64_t batch = row / (heads * tokens);
     T * out = dst + ((batch * heads + head) * tokens + token) * D;
 #pragma unroll
     for (int j = 0; j < D / 32; ++j) {
         const int col = j * 32 + lane;
         const float value = __fmul_rn(__fmul_rn(scale, v[j]), weight[col]);
-        float rotated;
+        float rotated = value;
         if constexpr (interleaved) {
             const float other = __shfl_xor_sync(0xffffffff, value, 1, 32);
-            const float4 matrix = ((const float4 *) pe)[token * (D / 2) + col / 2];
-            rotated = lane % 2 == 0
-                ? __fadd_rn(__fmul_rn(value, matrix.x), __fmul_rn(other, matrix.y))
-                : __fadd_rn(__fmul_rn(other, matrix.z), __fmul_rn(value, matrix.w));
+            if (col < 2 * rot_half) {
+                const float4 matrix = ((const float4 *) pe)[token * rot_half + col / 2];
+                rotated = lane % 2 == 0
+                    ? __fadd_rn(__fmul_rn(value, matrix.x), __fmul_rn(other, matrix.y))
+                    : __fadd_rn(__fmul_rn(other, matrix.z), __fmul_rn(value, matrix.w));
+            }
         } else {
-            const int partner = col < D / 2 ? col + D / 2 : col - D / 2;
-            const float other = __fmul_rn(__fmul_rn(scale, x[row * D + partner]), weight[partner]);
-            const float4 matrix = ((const float4 *) pe)[token * (D / 2) + col % (D / 2)];
-            rotated = col < D / 2
-                ? __fsub_rn(__fmul_rn(value, matrix.x), __fmul_rn(other, matrix.z))
-                : __fadd_rn(__fmul_rn(other, matrix.z), __fmul_rn(value, matrix.x));
+            if (col < 2 * rot_half) {
+                const int partner = col < rot_half ? col + rot_half : col - rot_half;
+                const float other = __fmul_rn(__fmul_rn(scale, x_row[partner]), weight[partner]);
+                const float4 matrix = ((const float4 *) pe)[token * rot_half + col % rot_half];
+                rotated = col < rot_half
+                    ? __fsub_rn(__fmul_rn(value, matrix.x), __fmul_rn(other, matrix.z))
+                    : __fadd_rn(__fmul_rn(other, matrix.z), __fmul_rn(value, matrix.x));
+            }
         }
         if constexpr (std::is_same<T, half>::value) {
             out[col] = __float2half_rn(__fmul_rn(rotated, output_scale));
@@ -63,7 +69,8 @@ static void rms_norm_mul_rope_apply_fused_cuda(ggml_backend_cuda_context & ctx,
     case D: \
         rms_norm_mul_rope_apply_fused<D, interleaved, T><<<(rows + 3) / 4, dim3(32, 4), 0, ctx.stream()>>>( \
             (const float *) x->data, (const float *) mul->src[1]->data, (const float *) rope->src[1]->data, \
-            output, x->ne[1], x->ne[2], rows, ggml_get_op_params_f32(norm, 0), scale); \
+            output, x->ne[1], x->ne[2], rows, x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), \
+            x->nb[3]/sizeof(float), rope->src[1]->ne[2], ggml_get_op_params_f32(norm, 0), scale); \
         break
     switch (x->ne[0]) {
         LAUNCH_RMS_ROPE(32);
@@ -192,6 +199,7 @@ static __global__ void rope_apply_f32(const float *    x,
                                       const float *    pe,
                                       float *          dst,
                                       int64_t          half_dim,
+                                      int64_t          rot_half,
                                       int64_t          heads,
                                       int64_t          tokens,
                                       int64_t          pairs,
@@ -206,15 +214,20 @@ static __global__ void rope_apply_f32(const float *    x,
     const int64_t head   = heads_first ? work % heads : work / tokens % heads;
     const int64_t batch  = work / (tokens * heads);
     const int64_t row    = heads_first ? (batch * heads + head) * tokens + token : work;
-    const int64_t i0     = interleaved ? 2 * j : j;
-    const int64_t i1     = interleaved ? 2 * j + 1 : j + half_dim;
+    const int64_t i0     = interleaved || j >= rot_half ? 2 * j : j;
+    const int64_t i1     = interleaved || j >= rot_half ? 2 * j + 1 : j + rot_half;
     const float * x_row  = x + head * strides.x[1] + token * strides.x[2] + batch * strides.x[3];
-    const float * matrix = pe + j * strides.pe[2] + token * strides.pe[3];
     const float   a      = x_row[i0 * strides.x[0]];
     const float   b      = x_row[i1 * strides.x[0]];
+    float *       out    = dst + row * half_dim * 2;
+    if (j >= rot_half) {
+        out[i0] = a;
+        out[i1] = b;
+        return;
+    }
+    const float * matrix = pe + j * strides.pe[2] + token * strides.pe[3];
     const float   c      = matrix[0];
     const float   s      = matrix[strides.pe[1]];
-    float *       out    = dst + row * half_dim * 2;
     // Match the separate mul/add rounding of the unfused graph.
     if (interleaved) {
         out[i0] = __fadd_rn(__fmul_rn(a, c), __fmul_rn(b, matrix[strides.pe[0]]));
@@ -231,7 +244,7 @@ static bool ggml_cuda_should_use_rope_apply_heads_first(const ggml_backend_cuda_
     const ggml_tensor * pe = dst->src[1];
     // Scheduling supports other widths and modes; enable only the configuration measured on SM86.
     const bool tuned = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_AMPERE_GA10X && x->ne[0] == 128 &&
-                       ggml_get_op_params_i32(dst, 0) == 0;
+                       ggml_get_op_params_i32(dst, 0) == 0 && pe->ne[2] == x->ne[0] / 2;
     const uintptr_t output_begin = reinterpret_cast<uintptr_t>(dst->data);
     const uintptr_t input_begin  = reinterpret_cast<uintptr_t>(x->data);
     const uintptr_t pe_begin     = reinterpret_cast<uintptr_t>(pe->data);
@@ -256,14 +269,14 @@ void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const ggml_cuda_kernel_launch_params launch_params = { blocks, threads, 0, ctx.stream() };
     if (ggml_cuda_should_use_rope_apply_heads_first(ctx, dst)) {
         ggml_cuda_kernel_launch(rope_apply_f32<false, true>, launch_params, (const float *)x->data,
-                                (const float *)pe->data, (float *)dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs,
+                                (const float *)pe->data, (float *)dst->data, x->ne[0] / 2, pe->ne[2], x->ne[1], x->ne[2], pairs,
                                 strides);
     } else if (ggml_get_op_params_i32(dst, 0)) {
         ggml_cuda_kernel_launch(rope_apply_f32<true>, launch_params, (const float *)x->data, (const float *)pe->data,
-                                (float *)dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs, strides);
+                                (float *)dst->data, x->ne[0] / 2, pe->ne[2], x->ne[1], x->ne[2], pairs, strides);
     } else {
         ggml_cuda_kernel_launch(rope_apply_f32<false>, launch_params, (const float *)x->data, (const float *)pe->data,
-                                (float *)dst->data, x->ne[0] / 2, x->ne[1], x->ne[2], pairs, strides);
+                                (float *)dst->data, x->ne[0] / 2, pe->ne[2], x->ne[1], x->ne[2], pairs, strides);
     }
 }
 

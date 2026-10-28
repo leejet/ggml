@@ -965,6 +965,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_compute_callback callback_compute;
+    void * callback_compute_user_data;
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
@@ -1896,6 +1898,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->callback_compute != NULL) {
+            sched->callback_compute(split_backend, sched->callback_compute_user_data);
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2169,6 +2175,11 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+void ggml_backend_sched_set_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_compute_callback callback, void * user_data) {
+    sched->callback_compute = callback;
+    sched->callback_compute_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

@@ -4388,7 +4388,7 @@ struct ggml_tensor * ggml_rope_apply(
     GGML_ASSERT(a->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32);
     GGML_ASSERT(a->ne[0] % 2 == 0);
     GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
-    GGML_ASSERT(pe->ne[2] == a->ne[0]/2 && pe->ne[3] == a->ne[2]);
+    GGML_ASSERT(pe->ne[2] > 0 && pe->ne[2] <= a->ne[0]/2 && pe->ne[3] == a->ne[2]);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1]*a->ne[3]);
     ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
