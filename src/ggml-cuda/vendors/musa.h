@@ -115,6 +115,7 @@
 #define cuMemAddressFree muMemAddressFree
 #define cuMemAddressReserve muMemAddressReserve
 #define cuMemCreate muMemCreate
+#define CUDA_ERROR_OUT_OF_MEMORY MUSA_ERROR_OUT_OF_MEMORY
 #define cuMemGetAllocationGranularity muMemGetAllocationGranularity
 #define cuMemMap muMemMap
 #define cuMemRelease muMemRelease

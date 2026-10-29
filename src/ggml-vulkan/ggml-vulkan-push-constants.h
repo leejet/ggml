@@ -459,6 +459,7 @@ struct vk_op_diag_mask_push_constants {
 
 struct vk_op_rope_apply_push_constants {
     uint32_t half_dim;
+    uint32_t rot_half;
     uint32_t heads;
     uint32_t tokens;
     uint32_t pairs;
@@ -470,7 +471,7 @@ struct vk_op_rope_apply_push_constants {
     uint32_t interleaved;
 };
 
-static_assert(sizeof(vk_op_rope_apply_push_constants) == 64, "rope_apply push constant layout mismatch");
+static_assert(sizeof(vk_op_rope_apply_push_constants) == 68, "rope_apply push constant layout mismatch");
 
 struct vk_op_rope_push_constants {
     uint32_t rope_mode;

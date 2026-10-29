@@ -1,0 +1,3 @@
+[submodule "src/ggml-cuda/vendors/cutlass"]
+	path = src/ggml-cuda/vendors/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

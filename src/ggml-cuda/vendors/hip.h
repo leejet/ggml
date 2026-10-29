@@ -111,6 +111,7 @@
 #define cuMemRelease hipMemRelease
 #define CUmemGenericAllocationHandle hipMemGenericAllocationHandle_t
 #define cuMemCreate hipMemCreate
+#define CUDA_ERROR_OUT_OF_MEMORY hipErrorOutOfMemory
 #define cuMemAddressReserve hipMemAddressReserve
 #define cuMemMap hipMemMap
 #define cuMemSetAccess hipMemSetAccess

@@ -200,6 +200,10 @@ static inline bool ggml_mul_mat_has_packed_i8_input(const struct ggml_tensor * o
            input->ne[2] == 1 && input->ne[3] == 1;
 }
 
+static inline const float * ggml_mul_mat_i8_input_scales(const struct ggml_tensor * op) {
+    return (const float *) ((const int8_t *) op->src[1]->data + op->src[0]->ne[0] * GGML_PAD(ggml_nrows(op), 4));
+}
+
 struct ggml_map_custom1_op_params {
     ggml_custom1_op_t  fun;
     int                n_tasks;

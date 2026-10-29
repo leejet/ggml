@@ -3,6 +3,32 @@
 
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
+static __global__ void scale_permute_f16(const float * src, half * dst,
+        int64_t dim, int64_t tokens, int64_t heads, int64_t count,
+        int64_t nb1, int64_t nb2, int64_t nb3, float scale) {
+    const int64_t index = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (index >= count) {
+        return;
+    }
+    const int64_t column = index % dim;
+    const int64_t row = index / dim;
+    const int64_t token = row % tokens;
+    const int64_t head = row / tokens % heads;
+    const int64_t batch = row / (tokens * heads);
+    const float4 value = *(const float4 *) (src + column + head * nb1 + token * nb2 + batch * nb3);
+    half2 * output = (half2 *) (dst + index);
+    output[0] = __floats2half2_rn(__fmul_rn(value.x, scale), __fmul_rn(value.y, scale));
+    output[1] = __floats2half2_rn(__fmul_rn(value.z, scale), __fmul_rn(value.w, scale));
+}
+
+void ggml_cuda_op_scale_permute_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, float scale) {
+    const int64_t count = ggml_nelements(dst);
+    scale_permute_f16<<<(count + 1023) / 1024, 256, 0, ctx.stream()>>>(
+        (const float *) src->data, (half *) dst->data, src->ne[0], src->ne[2], src->ne[1], count,
+        src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename T>
 static __global__ void scale_f32(const T * x, T * dst, const float scale, const float bias, const int64_t nelements) {
     ggml_cuda_pdl_lc();
