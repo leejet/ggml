@@ -3285,6 +3285,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     ggml_cuda_op_swiglu_clamp(ctx, dst);
                     break;
+                case GGML_GLU_OP_SITU:
+                    ggml_cuda_op_situ(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -4639,6 +4642,42 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_cuda_modulated_rms_norm_mmq_supported(ggml_backend_cuda_context * cuda_ctx,
+                                                       const ggml_tensor *         norm,
+                                                       const ggml_tensor *         weighted,
+                                                       const ggml_tensor *         product,
+                                                       const ggml_tensor *         sum,
+                                                       const ggml_tensor *         add,
+                                                       const ggml_tensor *         mm) {
+    const ggml_tensor * x              = norm->src[0];
+    const ggml_tensor * w              = mm->src[0];
+    const int           cc             = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const auto          f32_contiguous = [](const ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+    const auto vector3072 = [&](const ggml_tensor * t) {
+        return f32_contiguous(t) && t->ne[0] == 3072 && ggml_nelements(t) == 3072;
+    };
+    if (cc == GGML_CUDA_CC_AMPERE_GA10X && weighted->src[0] == norm && product->src[0] == weighted &&
+        sum->src[0] == weighted && sum->src[1] == product && add->src[0] == sum && mm->src[1] == add &&
+        f32_contiguous(x) && f32_contiguous(norm) && f32_contiguous(weighted) && f32_contiguous(product) &&
+        f32_contiguous(sum) && f32_contiguous(add) && f32_contiguous(mm) && vector3072(weighted->src[1]) &&
+        vector3072(product->src[1]) && vector3072(add->src[1]) && x->ne[0] == 3072 && x->ne[1] >= 1024 &&
+        x->ne[2] == 1 && x->ne[3] == 1 && w->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(w) &&
+        w->view_src == nullptr && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 &&
+        ggml_backend_buft_is_cuda(w->buffer->buft) && ggml_cuda_should_use_mmq(w->type, cc, add->ne[1], 0)) {
+        const uintptr_t output_begin = reinterpret_cast<uintptr_t>(mm->data);
+        const uintptr_t weight_begin = reinterpret_cast<uintptr_t>(w->data);
+        if (output_begin < weight_begin + ggml_nbytes(w) && weight_begin < output_begin + ggml_nbytes(mm)) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+
 static int ggml_cuda_can_fuse_concat_cast_f16(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * concat = cgraph->nodes[i];
     if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 || i + 1 >= cgraph->n_nodes) {
@@ -5538,6 +5577,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return count - 1;
     }
 #endif
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_MUL && ggml_can_fuse_subgraph(cgraph, i,
+                                                          { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL,
+                                                            GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_MUL_MAT },
+                                                          { i + 1, i + 7 })) {
+        const ggml_tensor * updated        = cgraph->nodes[i + 1];
+        const ggml_tensor * norm           = cgraph->nodes[i + 2];
+        const ggml_tensor * weighted       = cgraph->nodes[i + 3];
+        const ggml_tensor * product        = cgraph->nodes[i + 4];
+        const ggml_tensor * sum            = cgraph->nodes[i + 5];
+        const ggml_tensor * add            = cgraph->nodes[i + 6];
+        ggml_tensor *       mm             = cgraph->nodes[i + 7];
+        const ggml_tensor * residual       = updated->src[0] == node ? updated->src[1] :
+                                             updated->src[1] == node ? updated->src[0] :
+                                                                       nullptr;
+        const ggml_tensor * branch         = node->src[0];
+        const ggml_tensor * gate           = node->src[1];
+        const auto          f32_contiguous = [](const ggml_tensor * t) {
+            return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+        };
+        if (residual && residual != node && norm->src[0] == updated && f32_contiguous(node) &&
+            f32_contiguous(residual) && f32_contiguous(branch) && f32_contiguous(gate) &&
+            ggml_are_same_shape(branch, residual) && ggml_are_same_shape(branch, updated) && gate->ne[0] == 3072 &&
+            ggml_nelements(gate) == 3072 &&
+            ggml_cuda_modulated_rms_norm_mmq_supported(cuda_ctx, norm, weighted, product, sum, add, mm)) {
+            const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const uintptr_t ap = reinterpret_cast<uintptr_t>(a->data);
+                const uintptr_t bp = reinterpret_cast<uintptr_t>(b->data);
+                return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+            };
+            const ggml_tensor * w = mm->src[0];
+            if ((overlap(updated, residual) && updated->data != residual->data) ||
+                (overlap(updated, branch) && updated->data != branch->data) || overlap(updated, gate) ||
+                overlap(updated, weighted->src[1]) || overlap(updated, product->src[1]) ||
+                overlap(updated, add->src[1]) || overlap(updated, w) || overlap(mm, updated) || overlap(mm, w)) {
+                return 0;
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, w, add, nullptr, mm, node);
+            return 7;
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM &&
+        ggml_can_fuse_subgraph(
+            cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_MUL_MAT },
+            { i + 5 })) {
+        const ggml_tensor * add = cgraph->nodes[i + 4];
+        ggml_tensor *       mm  = cgraph->nodes[i + 5];
+        if (ggml_cuda_modulated_rms_norm_mmq_supported(cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                                                       cgraph->nodes[i + 3], add, mm)) {
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], add, nullptr, mm, add);
+            return 5;
+        }
+    }
+#endif
+
     if (node->op == GGML_OP_MUL && ggml_cuda_try_fuse_gated_residual(*cuda_ctx, cgraph, i)) {
         return 1;
     }
@@ -5601,6 +5696,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return activation_count - 1;
     }
 #endif
+
+    if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SITU &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+        const ggml_tensor * packed = node->src[0];
+        ggml_tensor *       mm     = cgraph->nodes[i + 1];
+        const ggml_tensor * w      = mm->src[0];
+        const int           cc     = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (cc == GGML_CUDA_CC_AMPERE_GA10X && mm->src[1] == node && node->src[1] == nullptr &&
+            w->type == GGML_TYPE_Q8_0 && packed->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+            mm->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_is_contiguous(packed) &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(mm) && w->ne[2] == 1 && w->ne[3] == 1 &&
+            w->view_src == nullptr && w->buffer && ggml_backend_buft_is_cuda(w->buffer->buft) &&
+            ggml_cuda_should_use_mmq(w->type, cc, node->ne[1], 0) && node->ne[2] == 1 && node->ne[3] == 1 &&
+            node->ne[0] % 4 == 0 && node->ne[1] >= 1024 &&
+            reinterpret_cast<uintptr_t>(packed->data) % alignof(float4) == 0) {
+            const uintptr_t output_begin = reinterpret_cast<uintptr_t>(mm->data);
+            const uintptr_t weight_begin = reinterpret_cast<uintptr_t>(w->data);
+            if (output_begin < weight_begin + ggml_nbytes(w) && weight_begin < output_begin + ggml_nbytes(mm)) {
+                return 0;
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, w, node, nullptr, mm, node);
+            return 1;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -7617,6 +7736,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
+                case GGML_GLU_OP_SITU:
+                    return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && op->src[0]->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous_1(op->src[0]) &&
+                           (op->src[1] == nullptr ||
+                            (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[1])));
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:
