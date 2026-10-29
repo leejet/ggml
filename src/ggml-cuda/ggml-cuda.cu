@@ -3285,6 +3285,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     ggml_cuda_op_swiglu_clamp(ctx, dst);
                     break;
+                case GGML_GLU_OP_SITU:
+                    ggml_cuda_op_situ(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -4165,7 +4168,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          check_leaf_sources = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -4198,11 +4202,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || (src->op == GGML_OP_NONE && !check_leaf_sources) || src == logits_may_alias) {
                     continue;
                 }
-                // ggml_cast stores its destination as src[1]; this is not a read dependency.
-                if (src_idx == 1 && cgraph->nodes[j]->op == GGML_OP_CPY && src == cgraph->nodes[j]) {
+                // CPY destination storage is not a read dependency.
+                if (src_idx == 1 && cgraph->nodes[j]->op == GGML_OP_CPY &&
+                    (src == cgraph->nodes[j] || check_leaf_sources)) {
                     continue;
                 }
 
@@ -4826,19 +4831,57 @@ static bool ggml_cuda_can_fuse_rms_norm_mul_rope_apply(const ggml_cgraph * cgrap
         x->nb[0] == sizeof(float) && ggml_is_contiguous(weight) && ggml_is_contiguous(pe) && ggml_is_contiguous(rope);
 }
 
-static bool ggml_cuda_can_fuse_rms_rope_scale_cast(const ggml_cgraph * cgraph, int i) {
-    if (i + 4 >= cgraph->n_nodes || !ggml_cuda_can_fuse_rms_norm_mul_rope_apply(cgraph, i) ||
-        !ggml_can_fuse_subgraph(cgraph, i,
-            { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY, GGML_OP_SCALE, GGML_OP_CPY }, { i + 4 })) {
-        return false;
+static int ggml_cuda_rms_rope_apply_fusion_size(const ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_can_fuse_rms_norm_mul_rope_apply(cgraph, i)) {
+        return 0;
     }
+    const bool scaled = i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_SCALE;
+    const int count   = scaled ? 5 : 4;
+    if (i + count > cgraph->n_nodes) {
+        return 3;
+    }
+    const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY,
+                            scaled ? GGML_OP_SCALE : GGML_OP_CPY, GGML_OP_CPY };
+    const int output_idx = i + count - 1;
+    const bool can_fuse = ggml_can_fuse_subgraph(cgraph, i, count, ops, &output_idx, 1);
     const ggml_tensor * rope = cgraph->nodes[i + 2];
-    const ggml_tensor * scale = cgraph->nodes[i + 3];
-    const ggml_tensor * cast = cgraph->nodes[i + 4];
-    return scale->src[0] == rope && cast->src[0] == scale &&
-        scale->type == GGML_TYPE_F32 && cast->type == GGML_TYPE_F16 &&
-        ggml_get_op_params_f32(scale, 1) == 0.0f &&
-        ggml_are_same_shape(rope, cast) && ggml_is_contiguous(cast);
+    const ggml_tensor * cast  = cgraph->nodes[i + count - 1];
+    const ggml_tensor * input = scaled ? cgraph->nodes[i + 3] : rope;
+    if (!can_fuse || cast->src[0] != input || cast->type != GGML_TYPE_F16 ||
+        !ggml_are_same_shape(rope, cast) || !ggml_is_contiguous(cast)) {
+        return 3;
+    }
+    if (scaled && (input->src[0] != rope || input->type != GGML_TYPE_F32 ||
+                   ggml_get_op_params_f32(input, 1) != 0.0f)) {
+        return 3;
+    }
+    return count;
+}
+
+static int ggml_cuda_try_fuse_rms_rope_apply(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const int count = ggml_cuda_rms_rope_apply_fusion_size(cgraph, i);
+    if (count == 0) {
+        return 0;
+    }
+    ggml_tensor * norm    = cgraph->nodes[i];
+    ggml_tensor * mul     = cgraph->nodes[i + 1];
+    ggml_tensor * rope    = cgraph->nodes[i + 2];
+    const int output_idx = i + count - 1;
+    ggml_tensor * dst     = cgraph->nodes[output_idx];
+    // Direct graph users can alias leaf inputs, unlike scheduler-owned allocations.
+    const bool overlaps = !ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1, false, true);
+    ggml_cuda_pool_alloc<char> scratch(ctx.pool());
+    void * output = overlaps ? scratch.alloc(ggml_nbytes(dst)) : dst->data;
+    if (count > 3) {
+        const float scale = count == 5 ? ggml_get_op_params_f32(cgraph->nodes[i + 3], 0) : 1.0f;
+        ggml_cuda_op_rms_norm_mul_rope_apply_f16(ctx, norm, mul, rope, (half *) output, scale);
+    } else {
+        ggml_cuda_op_rms_norm_mul_rope_apply_fused(ctx, norm, mul, rope, (float *) output);
+    }
+    if (overlaps) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, output, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    return count - 1;
 }
 
 static bool ggml_cuda_can_fuse_cont_scale_permute_cast(const ggml_cgraph * cgraph, int i) {
@@ -4851,7 +4894,8 @@ static bool ggml_cuda_can_fuse_cont_scale_permute_cast(const ggml_cgraph * cgrap
     const ggml_tensor * scale = cgraph->nodes[i + 1];
     const ggml_tensor * permute = cgraph->nodes[i + 2];
     const ggml_tensor * cast = cgraph->nodes[i + 3];
-    return src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) && src->ne[0] % 4 == 0 &&
+    return ggml_are_same_shape(src, cont) &&
+        src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) && src->ne[0] % 4 == 0 &&
         ((uintptr_t) src->data | src->nb[1] | src->nb[2] | src->nb[3]) % alignof(float4) == 0 &&
         scale->src[0] == cont && permute->src[0] == scale && cast->src[0] == permute &&
         scale->type == GGML_TYPE_F32 && cast->type == GGML_TYPE_F16 &&
@@ -5357,48 +5401,6 @@ static int ggml_cuda_try_fuse_i8_rms_rope(ggml_backend_cuda_context & ctx, ggml_
 }
 #endif
 
-static bool ggml_cuda_rms_rope_apply_has_disjoint_output(const ggml_tensor * norm,
-                                                       const ggml_tensor * mul,
-                                                       const ggml_tensor * rope,
-                                                       const ggml_tensor * dst) {
-    const uintptr_t output = reinterpret_cast<uintptr_t>(dst->data);
-    for (const ggml_tensor * input : { norm->src[0], mul->src[1], rope->src[1] }) {
-        const uintptr_t source = reinterpret_cast<uintptr_t>(input->data);
-        if (output < source + ggml_nbytes(input) && source < output + ggml_nbytes(dst)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-static bool ggml_cuda_should_fuse_rms_norm_mul_rope_apply(const ggml_tensor * norm,
-                                                          const ggml_tensor * mul,
-                                                          const ggml_tensor * rope,
-                                                          const ggml_tensor * dst) {
-    const ggml_tensor * x      = norm->src[0];
-    const ggml_tensor * weight = mul->src[1];
-    const ggml_tensor * pe     = rope->src[1];
-    if (mul->src[0] != norm || weight == norm || rope->src[0] != mul || ggml_get_op_params_i32(rope, 0) != 0) {
-        return false;
-    }
-    if (x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
-        weight->type != GGML_TYPE_F32 || pe->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 ||
-        (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16)) {
-        return false;
-    }
-    if (x->ne[0] != GGML_CUDA_ROPE_APPLY_HEAD_SIZE || x->nb[0] != sizeof(float) ||
-        pe->ne[2] != GGML_CUDA_ROPE_APPLY_HEAD_SIZE / 2 ||
-        ggml_nelements(x) / GGML_CUDA_ROPE_APPLY_HEAD_SIZE > INT_MAX ||
-        ggml_nelements(weight) != GGML_CUDA_ROPE_APPLY_HEAD_SIZE || weight->ne[0] != GGML_CUDA_ROPE_APPLY_HEAD_SIZE ||
-        !ggml_is_contiguous(weight) || !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul) ||
-        !ggml_is_contiguous(rope) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(dst, rope)) {
-        return false;
-    }
-    return ggml_cuda_rms_rope_apply_has_disjoint_output(norm, mul, rope, dst);
-}
-#endif
-
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5549,54 +5551,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return 3;
     }
-    if (ggml_cuda_can_fuse_rms_rope_scale_cast(cgraph, i)) {
-        ggml_tensor * dst = cgraph->nodes[i + 4];
-        const int output_idx = i + 4;
-        const bool overlaps = !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &output_idx, 1);
-        ggml_cuda_pool_alloc<half> scratch(cuda_ctx->pool());
-        half * output = overlaps ? scratch.alloc(ggml_nelements(dst)) : (half *) dst->data;
-        ggml_cuda_op_rms_norm_mul_rope_apply_f16(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
-                                               output, ggml_get_op_params_f32(cgraph->nodes[i + 3], 0));
-        if (overlaps) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, output, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
-        }
-        return 4;
-    }
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Performance policy: other architectures need correctness and timing coverage before enablement.
-    const bool rms_rope_apply_tuned = ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_AMPERE_GA10X;
-    if (node->op == GGML_OP_RMS_NORM && rms_rope_apply_tuned &&
-        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY }, { i + 2 })) {
-        ggml_tensor * mul  = cgraph->nodes[i + 1];
-        ggml_tensor * rope = cgraph->nodes[i + 2];
-        if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY, GGML_OP_CPY },
-                                   { i + 3 })) {
-            ggml_tensor * cast = cgraph->nodes[i + 3];
-            if (cast->src[0] == rope && cast->src[1] == cast && cast->type == GGML_TYPE_F16 &&
-                ggml_cuda_should_fuse_rms_norm_mul_rope_apply(node, mul, rope, cast)) {
-                ggml_cuda_op_rms_norm_mul_rope_apply(*cuda_ctx, node, mul, rope, cast);
-                return 3;
-            }
-        }
-        if (ggml_cuda_should_fuse_rms_norm_mul_rope_apply(node, mul, rope, rope)) {
-            ggml_cuda_op_rms_norm_mul_rope_apply(*cuda_ctx, node, mul, rope, rope);
-            return 2;
-        }
-    }
-#endif
-
-    if (ggml_cuda_can_fuse_rms_norm_mul_rope_apply(cgraph, i) &&
-        ggml_cuda_rms_rope_apply_has_disjoint_output(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 2])) {
-        const int output_idx = i + 2;
-        ggml_tensor * dst = cgraph->nodes[i + 2];
-        const bool overlaps = !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &output_idx, 1);
-        ggml_cuda_pool_alloc<float> scratch(cuda_ctx->pool());
-        float * output = overlaps ? scratch.alloc(ggml_nelements(dst)) : (float *) dst->data;
-        ggml_cuda_op_rms_norm_mul_rope_apply_fused(*cuda_ctx, node, cgraph->nodes[i + 1], dst, output);
-        if (overlaps) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, output, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
-        }
-        return 2;
+    if (const int skip = ggml_cuda_try_fuse_rms_rope_apply(*cuda_ctx, cgraph, i)) {
+        return skip;
     }
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
     if (const int count = ggml_cuda_try_fuse_i8_gated_residual(*cuda_ctx, cgraph, i)) {
@@ -6970,11 +6926,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 add_alloc_deps(i, i + 2);
             }
 #endif
-            if (ggml_cuda_can_fuse_rms_norm_mul_rope_apply(cgraph, i)) {
-                add_alloc_deps(i, i + 2);
-            }
-            if (ggml_cuda_can_fuse_rms_rope_scale_cast(cgraph, i)) {
-                add_alloc_deps(i, i + 4);
+            if (const int count = ggml_cuda_rms_rope_apply_fusion_size(cgraph, i)) {
+                add_alloc_deps(i, i + count - 1);
             }
             if (ggml_cuda_can_fuse_cont_scale_permute_cast(cgraph, i)) {
                 add_alloc_deps(i, i + 3);
@@ -7682,6 +7635,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
+                case GGML_GLU_OP_SITU:
+                    return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && op->src[0]->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous_1(op->src[0]) &&
+                           (op->src[1] == nullptr ||
+                            (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[1])));
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:

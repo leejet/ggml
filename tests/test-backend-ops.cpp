@@ -9740,11 +9740,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
 
+    for (int v : { 0, 1 }) {
+        for (bool swapped : { false, true }) {
+            test_cases.emplace_back(new test_glu(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 2, 5, 3, 2 }, v, swapped));
+            test_cases.emplace_back(new test_glu(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 10, 7, 11, 13 }, v, swapped));
+            test_cases.emplace_back(new test_glu(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 16384, 17, 1, 1 }, v, swapped));
+        }
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 1, 5, 3, 2 }, v));
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 5, 7, 11, 13 }, v));
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 8192, 17, 1, 1 }, v));
+    }
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
                     continue;
                 }
 
