@@ -1150,6 +1150,10 @@ void launch_fattn(
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
+            if (ncols1 == 128 && ncols2 == 1 && DKQ == 128 && ampere_mma_available(cc) &&
+                tiles_efficiency_percent >= 95) {
+                return false;
+            }
             if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
                 return false;
             }

@@ -316,6 +316,7 @@ extern "C" {
     // if the user returns false, the scheduler will cancel the graph compute
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+    typedef void (*ggml_backend_sched_compute_callback)(ggml_backend_t backend, void * user_data);
 
     // Callback while copying input weights of a split
     // if the user returns false the scheduler simply copies the entire weight
@@ -371,6 +372,9 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Called after a split's inputs have been copied and before its computation is submitted.
+    GGML_API void                 ggml_backend_sched_set_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_compute_callback callback, void * user_data);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
