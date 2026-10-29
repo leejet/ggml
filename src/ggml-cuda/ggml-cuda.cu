@@ -3285,6 +3285,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     ggml_cuda_op_swiglu_clamp(ctx, dst);
                     break;
+                case GGML_GLU_OP_SITU:
+                    ggml_cuda_op_situ(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -5602,6 +5605,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
+    if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SITU &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+        const ggml_tensor * packed = node->src[0];
+        ggml_tensor *       mm     = cgraph->nodes[i + 1];
+        const ggml_tensor * w      = mm->src[0];
+        const int           cc     = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (cc == GGML_CUDA_CC_AMPERE_GA10X && mm->src[1] == node && node->src[1] == nullptr &&
+            w->type == GGML_TYPE_Q8_0 && packed->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+            mm->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_is_contiguous(packed) &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(mm) && w->ne[2] == 1 && w->ne[3] == 1 &&
+            w->view_src == nullptr && w->buffer && ggml_backend_buft_is_cuda(w->buffer->buft) &&
+            ggml_cuda_should_use_mmq(w->type, cc, node->ne[1], 0) && node->ne[2] == 1 && node->ne[3] == 1 &&
+            node->ne[0] % 4 == 0 && node->ne[1] >= 1024 &&
+            reinterpret_cast<uintptr_t>(packed->data) % alignof(float4) == 0) {
+            const uintptr_t output_begin = reinterpret_cast<uintptr_t>(mm->data);
+            const uintptr_t weight_begin = reinterpret_cast<uintptr_t>(w->data);
+            if (output_begin < weight_begin + ggml_nbytes(w) && weight_begin < output_begin + ggml_nbytes(mm)) {
+                return 0;
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, w, node, nullptr, mm, node);
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -7617,6 +7644,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
+                case GGML_GLU_OP_SITU:
+                    return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && op->src[0]->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous_1(op->src[0]) &&
+                           (op->src[1] == nullptr ||
+                            (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[1])));
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:

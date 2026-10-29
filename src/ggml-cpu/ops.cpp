@@ -10628,6 +10628,36 @@ void ggml_compute_forward_unary(
     }
 }
 
+static void ggml_compute_forward_situ(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(src1 == nullptr || (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1)));
+    const int64_t columns    = dst->ne[0];
+    const int64_t rows       = ggml_nrows(dst);
+    const int64_t per_thread = (rows + params->nth - 1) / params->nth;
+    const int64_t begin      = per_thread * params->ith;
+    const int64_t end        = std::min(begin + per_thread, rows);
+    const bool    swapped    = ggml_get_op_params_i32(dst, 1) != 0;
+    for (int64_t row = begin; row < end; ++row) {
+        const float * gate = reinterpret_cast<const float *>(static_cast<const char *>(src0->data) + row * src0->nb[1]);
+        const float * up   = reinterpret_cast<const float *>(static_cast<const char *>(src1 ? src1->data : src0->data) +
+                                                             row * (src1 ? src1->nb[1] : src0->nb[1]));
+        if (src1 == nullptr) {
+            gate += swapped ? columns : 0;
+            up += swapped ? 0 : columns;
+        }
+        float * output = static_cast<float *>(dst->data) + row * columns;
+        for (int64_t col = 0; col < columns; ++col) {
+            const float g = gate[col];
+            const float a = tanhf(0.25f * g) * 4.0f;
+            const float b = tanhf((1.0f / 25.0f) * up[col]) * 25.0f;
+            output[col]   = (a * (1.0f / (1.0f + expf(-g)))) * b;
+        }
+    }
+}
+
 //ggml_compute_forward_glu
 
 void ggml_compute_forward_glu(
@@ -10664,6 +10694,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_CLAMP:
             {
                 ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ(params, dst);
             } break;
         default:
             {
