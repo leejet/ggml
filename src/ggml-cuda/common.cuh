@@ -379,6 +379,15 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+// INT8 convrot MUL_MAT rides the legacy cuBLAS/hipBLAS i8xi8 -> i32 GEMM
+// (see ggml_cuda_mul_mat_i8). Do not widen this set without correctness
+// evidence for the BLAS route on the target architecture.
+static bool ggml_cuda_i8_blas_available(const int cc) {
+    return turing_mma_available(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
+           GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc) ||
+           GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
 // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
 static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
     GGML_ASSERT(tensor != nullptr);
@@ -1454,6 +1463,9 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+    cublasLtHandle_t cublaslt_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#endif
 
     int curr_stream_no = 0;
 
@@ -1547,6 +1559,20 @@ struct ggml_backend_cuda_context {
         }
         return cublas_handles[device][curr_stream_no];
     }
+
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+    cublasLtHandle_t cublaslt_handle(int device) {
+        if (cublaslt_handles[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasLtCreate(&cublaslt_handles[device]));
+        }
+        return cublaslt_handles[device];
+    }
+
+    cublasLtHandle_t cublaslt_handle() {
+        return cublaslt_handle(device);
+    }
+#endif
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];

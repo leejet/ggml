@@ -60,6 +60,7 @@ void ggml_compute_forward_diag_mask_inf(const struct ggml_compute_params * param
 void ggml_compute_forward_diag_mask_zero(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_soft_max(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_rope_apply(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -117,6 +118,7 @@ void ggml_compute_forward_cross_entropy_loss_back(const struct ggml_compute_para
 void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_quantize_i8_convrot(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }

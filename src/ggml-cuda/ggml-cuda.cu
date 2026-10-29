@@ -26,6 +26,8 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/sage-attn.cuh"
+#include "ggml-cuda/sol-attn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -87,6 +89,10 @@
 #include <memory>
 #include <mutex>
 #include <cstdarg>
+#if defined(GGML_USE_HIP) && defined(GGML_HIPBLASLT)
+#include <hipblaslt/hipblaslt.h>
+#include <cstdlib>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -756,6 +762,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
         }
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+        if (cublaslt_handles[i] != nullptr) {
+            CUBLAS_CHECK(cublasLtDestroy(cublaslt_handles[i]));
+        }
+#endif
     }
 }
 
@@ -951,6 +962,12 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
+    if (tensor->op == GGML_OP_SAGE_ATTN) {
+        size = ggml_cuda_sage_attn_get_alloc_size(tensor);
+    }
+    if (tensor->op == GGML_OP_SOL_ATTN) {
+        size = ggml_cuda_sol_attn_get_alloc_size(tensor);
+    }
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
@@ -1379,6 +1396,512 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
+
+#if !defined(GGML_USE_MUSA)
+__global__ void quantize_rowwise_i8_cuda(const float * src, int8_t * dst, float * scales, int64_t k, int64_t rows) {
+    const int64_t row = blockIdx.x;
+    const int tid     = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    __shared__ float maxima[256];
+    const float * src_row = src + row * k;
+    int8_t * dst_row      = dst + row * k;
+    float local_max       = 0.0f;
+    for (int64_t i = tid; i < k; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(src_row[i]));
+    }
+    maxima[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            maxima[tid] = fmaxf(maxima[tid], maxima[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float scale = maxima[0] / 127.0f;
+    if (tid == 0) {
+        scales[row] = scale;
+    }
+    if (scale == 0.0f) {
+        for (int64_t i = tid; i < k; i += blockDim.x) {
+            dst_row[i] = 0;
+        }
+        return;
+    }
+
+    const float inv_scale = 1.0f / scale;
+    for (int64_t i = tid; i < k; i += blockDim.x) {
+        int value  = __float2int_rn(src_row[i] * inv_scale);
+        value      = max(-127, min(127, value));
+        dst_row[i] = (int8_t)value;
+    }
+}
+
+__global__ void quantize_rowwise_i8_convrot_cuda(
+        const float * src, int8_t * dst, float * scales,
+        int64_t k, int64_t rows, int64_t dst_stride) {
+    constexpr int group_size      = 256;
+    constexpr int group_threads   = group_size / 4;
+    constexpr int groups_per_wave = 1024 / group_threads;
+
+    const int64_t row = blockIdx.x;
+    const int tid     = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    extern __shared__ float values[];
+    __shared__ float maxima[32];
+    const float * src_row = src + row * k;
+    int8_t * dst_row      = dst + row * dst_stride;
+
+    for (int64_t i = tid; i < k; i += blockDim.x) {
+        values[i] = src_row[i] * (1.0f / 16.0f);
+    }
+    __syncthreads();
+
+    const int group_lane = tid % group_threads;
+    const int wave_group = tid / group_threads;
+    const int64_t groups = k / group_size;
+    for (int64_t group_base = 0; group_base < groups; group_base += groups_per_wave) {
+        const int64_t group = group_base + wave_group;
+#pragma unroll
+        for (int stride = 1; stride < group_size; stride *= 4) {
+            if (group < groups) {
+                float * group_values = values + group * group_size;
+                const int base       = (group_lane / stride) * 4 * stride + group_lane % stride;
+                const int i0         = base;
+                const int i1         = i0 + stride;
+                const int i2         = i1 + stride;
+                const int i3         = i2 + stride;
+                const float a        = group_values[i0];
+                const float b        = group_values[i1];
+                const float c        = group_values[i2];
+                const float d        = group_values[i3];
+                group_values[i0]     =  a + b + c - d;
+                group_values[i1]     =  a + b - c + d;
+                group_values[i2]     =  a - b + c + d;
+                group_values[i3]     = -a + b + c + d;
+            }
+            __syncthreads();
+        }
+    }
+
+    float local_max = 0.0f;
+    for (int64_t i = tid; i < k; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(values[i]));
+    }
+    local_max = warp_reduce_max<32>(local_max);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        maxima[warp] = local_max;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        local_max = lane < blockDim.x / 32 ? maxima[lane] : 0.0f;
+        local_max = warp_reduce_max<32>(local_max);
+        if (lane == 0) {
+            maxima[0]  = local_max / 127.0f;
+            if (scales != nullptr) {
+                scales[row] = maxima[0];
+            } else {
+                *((float *)(dst_row + k)) = maxima[0];
+            }
+        }
+    }
+    __syncthreads();
+
+    const float row_scale = maxima[0];
+    const float inv_scale = row_scale == 0.0f ? 0.0f : 1.0f / row_scale;
+    for (int64_t i = tid; i < k; i += blockDim.x) {
+        int value  = row_scale == 0.0f ? 0 : __float2int_rn(values[i] * inv_scale);
+        value      = max(-127, min(127, value));
+        dst_row[i] = (int8_t)value;
+    }
+}
+
+__global__ void convrot_group_amax_i8_cuda(
+        const float * src, float * partial_max, int64_t k, int64_t groups, int64_t total_groups) {
+    const int64_t index = blockIdx.x;
+    const int tid       = threadIdx.x;
+    if (index >= total_groups) {
+        return;
+    }
+
+    __shared__ float values[256];
+    __shared__ float maxima[2];
+    const int64_t row   = index / groups;
+    const int64_t group = index - row * groups;
+    const float * input = src + row * k + group * 256;
+    values[tid]       = input[tid] * (1.0f / 16.0f);
+    values[tid + 64]  = input[tid + 64] * (1.0f / 16.0f);
+    values[tid + 128] = input[tid + 128] * (1.0f / 16.0f);
+    values[tid + 192] = input[tid + 192] * (1.0f / 16.0f);
+    __syncthreads();
+
+#pragma unroll
+    for (int stride = 1; stride < 256; stride *= 4) {
+        const int base   = (tid / stride) * 4 * stride + tid % stride;
+        const int i0     = base;
+        const int i1     = i0 + stride;
+        const int i2     = i1 + stride;
+        const int i3     = i2 + stride;
+        const float a    = values[i0];
+        const float b    = values[i1];
+        const float c    = values[i2];
+        const float d    = values[i3];
+        values[i0]       =  a + b + c - d;
+        values[i1]       =  a + b - c + d;
+        values[i2]       =  a - b + c + d;
+        values[i3]       = -a + b + c + d;
+        __syncthreads();
+    }
+
+    float value = fmaxf(fabsf(values[tid]), fabsf(values[tid + 64]));
+    value       = fmaxf(value, fabsf(values[tid + 128]));
+    value       = fmaxf(value, fabsf(values[tid + 192]));
+    value = warp_reduce_max<32>(value);
+    if ((tid & 31) == 0) {
+        maxima[tid >> 5] = value;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        partial_max[index] = fmaxf(maxima[0], maxima[1]);
+    }
+}
+
+__global__ void reduce_convrot_row_amax_i8_cuda(
+        const float * partial_max, float * scales, int64_t groups, int64_t rows) {
+    const int64_t row = blockIdx.x;
+    const int tid     = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    __shared__ float maxima[256];
+    float value = 0.0f;
+    for (int64_t group = tid; group < groups; group += blockDim.x) {
+        value = fmaxf(value, partial_max[row * groups + group]);
+    }
+    maxima[tid] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            maxima[tid] = fmaxf(maxima[tid], maxima[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        scales[row] = maxima[0] / 127.0f;
+    }
+}
+
+__global__ void convrot_group_quantize_i8_cuda(
+        const float * src, int8_t * dst, const float * scales,
+        int64_t k, int64_t groups, int64_t total_groups, int64_t dst_stride) {
+    const int64_t index = blockIdx.x;
+    const int tid       = threadIdx.x;
+    if (index >= total_groups) {
+        return;
+    }
+
+    __shared__ float values[256];
+    const int64_t row   = index / groups;
+    const int64_t group = index - row * groups;
+    const float * input = src + row * k + group * 256;
+    int8_t * output     = dst + row * dst_stride + group * 256;
+    values[tid]       = input[tid] * (1.0f / 16.0f);
+    values[tid + 64]  = input[tid + 64] * (1.0f / 16.0f);
+    values[tid + 128] = input[tid + 128] * (1.0f / 16.0f);
+    values[tid + 192] = input[tid + 192] * (1.0f / 16.0f);
+    __syncthreads();
+
+#pragma unroll
+    for (int stride = 1; stride < 256; stride *= 4) {
+        const int base   = (tid / stride) * 4 * stride + tid % stride;
+        const int i0     = base;
+        const int i1     = i0 + stride;
+        const int i2     = i1 + stride;
+        const int i3     = i2 + stride;
+        const float a    = values[i0];
+        const float b    = values[i1];
+        const float c    = values[i2];
+        const float d    = values[i3];
+        values[i0]       =  a + b + c - d;
+        values[i1]       =  a + b - c + d;
+        values[i2]       =  a - b + c + d;
+        values[i3]       = -a + b + c + d;
+        __syncthreads();
+    }
+
+    const float row_scale = scales[row];
+    const float inv_scale = row_scale == 0.0f ? 0.0f : 1.0f / row_scale;
+    const int indices[4]  = { tid, tid + 64, tid + 128, tid + 192 };
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int value = row_scale == 0.0f ? 0 : __float2int_rn(values[indices[i]] * inv_scale);
+        value     = max(-127, min(127, value));
+        output[indices[i]] = (int8_t)value;
+    }
+    if (group == 0 && tid == 0 && dst_stride != k) {
+        *((float *)(dst + row * dst_stride + k)) = row_scale;
+    }
+}
+
+__global__ void dequantize_i32_rows_cuda(
+        const int32_t * src, const float * scales, const float * weight_scales,
+        const float * bias, float * dst, int64_t n, int64_t rows) {
+    const int64_t output = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row    = blockIdx.y;
+    if (output < n && row < rows) {
+        const int64_t index = row * n + output;
+        const float activation_scale = scales[row];
+        float value = (float)src[index] * activation_scale;
+        if (weight_scales != nullptr) {
+            value *= weight_scales[output];
+        }
+        if (bias != nullptr) {
+            value += bias[output];
+        }
+        dst[index] = value;
+    }
+}
+
+static void ggml_cuda_quantize_i8_convrot(
+        ggml_backend_cuda_context & ctx,
+        const float * src,
+        int8_t * dst,
+        float * scales,
+        int64_t k,
+        int64_t rows,
+        int64_t rows_padded,
+        int64_t dst_stride) {
+    cudaStream_t stream = ctx.stream();
+    if (rows_padded > rows) {
+        CUDA_CHECK(cudaMemsetAsync(
+            dst + dst_stride * rows, 0, (size_t)dst_stride * (rows_padded - rows), stream));
+    }
+
+    const size_t nbytes_shared = (size_t)k * sizeof(float);
+    const size_t smpbo         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    if (nbytes_shared + 128 <= smpbo) {
+        CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda, smpbo - 128);
+        quantize_rowwise_i8_convrot_cuda<<<rows, 1024, nbytes_shared, stream>>>(
+            src, dst, scales, k, rows, dst_stride);
+        return;
+    }
+
+    const int64_t groups       = k / 256;
+    const int64_t total_groups = rows * groups;
+    ggml_cuda_pool_alloc<float> partial_max(ctx.pool(), total_groups);
+    ggml_cuda_pool_alloc<float> packed_scales(ctx.pool());
+    float * scales_d = scales;
+    if (scales_d == nullptr) {
+        scales_d = packed_scales.alloc(rows);
+    }
+    convrot_group_amax_i8_cuda<<<total_groups, 64, 0, stream>>>(
+        src, partial_max.get(), k, groups, total_groups);
+    reduce_convrot_row_amax_i8_cuda<<<rows, 256, 0, stream>>>(
+        partial_max.get(), scales_d, groups, rows);
+    convrot_group_quantize_i8_cuda<<<total_groups, 64, 0, stream>>>(
+        src, dst, scales_d, k, groups, total_groups, dst_stride);
+}
+
+static bool ggml_cuda_op_quantize_i8_convrot(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        int group_size) {
+    const int64_t rows        = ggml_nrows(src);
+    const int64_t rows_padded = GGML_PAD(rows, 4);
+    const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + src->ne[0] - 1) / src->ne[0];
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I8 ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+        group_size != 256 || src->ne[0] % group_size != 0 ||
+        dst->ne[0] != src->ne[0] || dst->ne[1] != rows_padded + scale_rows) {
+        return false;
+    }
+
+    int8_t * dst_data = (int8_t *)dst->data;
+    ggml_cuda_quantize_i8_convrot(
+        ctx,
+        (const float *)src->data,
+        dst_data,
+        (float *)(dst_data + src->ne[0] * rows_padded),
+        src->ne[0],
+        rows,
+        rows_padded,
+        src->ne[0]);
+    return true;
+}
+
+#if defined(GGML_USE_HIP) && defined(GGML_HIPBLASLT)
+static bool ggml_cuda_mul_mat_i8_hipblaslt(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const int8_t * qdata_d,
+        int32_t * accum,
+        int64_t n,
+        int64_t rows_padded,
+        int64_t k) {
+    const char * disabled = std::getenv("GGML_HIPBLASLT_DISABLE_I8");
+    if (disabled != nullptr && strcmp(disabled, "1") == 0) {
+        return false;
+    }
+
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(ctx.stream(), &capture_status) != hipSuccess ||
+        capture_status != hipStreamCaptureStatusNone) {
+        return false;
+    }
+
+    hipblasLtHandle_t handle = nullptr;
+    hipblasLtMatmulDesc_t op_desc = nullptr;
+    hipblasLtMatrixLayout_t a_desc = nullptr;
+    hipblasLtMatrixLayout_t b_desc = nullptr;
+    hipblasLtMatrixLayout_t c_desc = nullptr;
+    hipblasLtMatrixLayout_t d_desc = nullptr;
+    hipblasLtMatmulPreference_t preference = nullptr;
+    bool ok = false;
+
+    auto cleanup = [&]() {
+        if (preference) hipblasLtMatmulPreferenceDestroy(preference);
+        if (d_desc) hipblasLtMatrixLayoutDestroy(d_desc);
+        if (c_desc) hipblasLtMatrixLayoutDestroy(c_desc);
+        if (b_desc) hipblasLtMatrixLayoutDestroy(b_desc);
+        if (a_desc) hipblasLtMatrixLayoutDestroy(a_desc);
+        if (op_desc) hipblasLtMatmulDescDestroy(op_desc);
+        if (handle) hipblasLtDestroy(handle);
+    };
+
+    if (hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+    if (hipblasLtMatmulDescCreate(&op_desc, HIPBLAS_COMPUTE_32I, HIP_R_32I) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_8I, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_8I, k, rows_padded, k) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&c_desc, HIP_R_32I, n, rows_padded, n) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatrixLayoutCreate(&d_desc, HIP_R_32I, n, rows_padded, n) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulPreferenceCreate(&preference) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    hipblasOperation_t trans_a = HIPBLAS_OP_T;
+    hipblasOperation_t trans_b = HIPBLAS_OP_N;
+    if (hipblasLtMatmulDescSetAttribute(op_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmulDescSetAttribute(op_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    uint64_t workspace_size = 0;
+    if (hipblasLtMatmulPreferenceSetAttribute(preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &workspace_size, sizeof(workspace_size)) != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    hipblasLtMatmulHeuristicResult_t heuristic = {};
+    int returned = 0;
+    if (hipblasLtMatmulAlgoGetHeuristic(handle, op_desc, a_desc, b_desc, c_desc, d_desc,
+                                        preference, 1, &heuristic, &returned) != HIPBLAS_STATUS_SUCCESS ||
+        returned == 0 || heuristic.state != HIPBLAS_STATUS_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    ok = hipblasLtMatmul(handle, op_desc, &alpha, src0->data, a_desc, qdata_d, b_desc,
+                         &beta, accum, c_desc, accum, d_desc, &heuristic.algo,
+                         nullptr, 0, ctx.stream()) == HIPBLAS_STATUS_SUCCESS;
+    cleanup();
+    return ok;
+}
+#endif
+
+static void ggml_cuda_mul_mat_i8(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_i8_blas_available(cc)) {
+        GGML_ABORT("INT8 mul_mat (convrot) not supported on this arch (cc %d)", cc);
+    }
+    GGML_ASSERT(src0->type == GGML_TYPE_I8);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t k           = src0->ne[0];
+    const int64_t n           = src0->ne[1];
+    const int64_t rows        = ggml_nrows(dst);
+    const bool prequantized   = src1->type == GGML_TYPE_I8;
+    const int64_t rows_padded = GGML_PAD(rows, 4);
+    const int64_t qstride     = k;
+    const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
+    GGML_ASSERT(src1->ne[0] == k);
+    GGML_ASSERT(!prequantized || ggml_mul_mat_has_packed_i8_input(dst));
+    GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 256);
+
+    ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
+    ggml_cuda_pool_alloc<float> scales(ctx.pool());
+    cudaStream_t stream = ctx.stream();
+    int8_t * qdata_d    = prequantized ? (int8_t *)src1->data : qdata.alloc((size_t)k * rows_padded);
+    float * scales_d    = prequantized
+        ? (float *)((int8_t *)src1->data + k * rows_padded)
+        : scales.alloc(rows);
+
+    if (!prequantized && convrot_group_size == 0) {
+        if (rows_padded > rows) {
+            CUDA_CHECK(cudaMemsetAsync(qdata_d + k * rows, 0, (size_t)k * (rows_padded - rows), stream));
+        }
+        quantize_rowwise_i8_cuda<<<rows, 256, 0, stream>>>(
+            (const float *)src1->data, qdata_d, scales_d, k, rows);
+    } else if (!prequantized) {
+        ggml_cuda_quantize_i8_convrot(
+            ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k);
+    }
+
+    const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
+    const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
+    ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
+
+    bool direct_ok = false;
+#if defined(GGML_USE_HIP) && defined(GGML_HIPBLASLT)
+    direct_ok = ggml_cuda_mul_mat_i8_hipblaslt(ctx, src0, qdata_d, accum.get(), n, rows_padded, k);
+#endif
+    if (!direct_ok) {
+        const int32_t alpha = 1;
+        const int32_t beta  = 0;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)n, (int)rows_padded, (int)k,
+            &alpha, src0->data, CUDA_R_8I, (int)k,
+                    qdata_d, CUDA_R_8I, (int)qstride,
+            &beta,  accum.get(), CUDA_R_32I, (int)n,
+            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    const dim3 dequant_grid((n + 255) / 256, rows, 1);
+    dequantize_i32_rows_cuda<<<dequant_grid, 256, 0, stream>>>(
+        accum.get(), scales_d, weight_scales, bias,
+        (float *)dst->data, n, rows);
+}
+#endif
+
 static __global__ void k_compute_batched_ptrs(
         const void * src0_as_f16, const void * src1_as_f16, char * dst,
         const void ** ptrs_src, void ** ptrs_dst,
@@ -1402,6 +1925,192 @@ static __global__ void k_compute_batched_ptrs(
     ptrs_src[1*ne23 + i12 + i13*ne12] = (const char *) src1_as_f16 + i12*nb12 + i13*nb13;
     ptrs_dst[0*ne23 + i12 + i13*ne12] = (      char *)         dst + i12*nbd2 + i13*nbd3;
 }
+
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+static __global__ void fp8_activation_amax_cuda(
+        const char * src,
+        float * amax,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        size_t nb0,
+        size_t nb1,
+        size_t nb2,
+        size_t nb3) {
+    const int64_t batch = blockIdx.y;
+    const int64_t i2    = batch % ne2;
+    const int64_t i3    = batch / ne2;
+    const int64_t n     = ne0 * ne1;
+
+    float value = 0.0f;
+    for (int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < n;
+         index += (int64_t)blockDim.x * gridDim.x) {
+        const int64_t i0 = index % ne0;
+        const int64_t i1 = index / ne0;
+        const float x = *(const float *)(src + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        value = fmaxf(value, fabsf(x));
+    }
+
+    __shared__ float maxima[256];
+    maxima[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicMax((unsigned int *)(amax + batch * 4), __float_as_uint(maxima[0]));
+    }
+}
+
+static __global__ void quantize_fp8_activation_e4m3_cuda(
+        const char * src,
+        uint8_t * dst,
+        const float * amax,
+        float * scale,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        size_t nb0,
+        size_t nb1,
+        size_t nb2,
+        size_t nb3) {
+    const int64_t batch = blockIdx.y;
+    const int64_t i2    = batch % ne2;
+    const int64_t i3    = batch / ne2;
+    const int64_t n     = ne0 * ne1;
+    const float maximum = amax[batch * 4];
+    const float quant_scale = maximum > 0.0f ? maximum / 448.0f : 1.0f;
+    const float inverse_scale = maximum > 0.0f ? 448.0f / maximum : 1.0f;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        scale[batch * 4] = quant_scale;
+    }
+    for (int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < n;
+         index += (int64_t)blockDim.x * gridDim.x) {
+        const int64_t i0 = index % ne0;
+        const int64_t i1 = index / ne0;
+        const float x = *(const float *)(src + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+        const __nv_fp8_e4m3 fp8(x * inverse_scale);
+        dst[batch * n + index] = fp8.__x;
+    }
+}
+
+static bool ggml_cuda_should_use_fp8_matmul(
+        const ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+#if CUDART_VERSION < 12010
+    if (cc == GGML_CUDA_CC_ADA_LOVELACE) {
+        return false;
+    }
+#endif
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_ADA_LOVELACE ||
+        (src0->type != GGML_TYPE_F8_E4M3 && src0->type != GGML_TYPE_F8_E5M2) ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        dst->op_params[0] == GGML_PREC_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] * src1->ne[3] > 65535 ||
+        src0->ne[0] % 16 != 0 || src0->ne[1] % 16 != 0 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) ||
+        (uintptr_t)src0->data % 16 != 0 || (uintptr_t)dst->data % 16 != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_fp8(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne00 == ne10);
+    GGML_ASSERT(ne0 == ne01 && ne1 == ne11 && ne2 == ne12 && ne3 == ne13);
+
+    const int64_t batch_count    = ne12 * ne13;
+    const int64_t matrix_size    = ne10 * ne11;
+    const int64_t blocks         = std::min<int64_t>((matrix_size + 255) / 256, 1024);
+    cudaStream_t stream          = ctx.stream();
+
+    ggml_cuda_pool_alloc<uint8_t> activation_fp8(ctx.pool(), matrix_size * batch_count);
+    ggml_cuda_pool_alloc<float> scale_storage(ctx.pool(), batch_count * 8);
+    float * activation_amax  = scale_storage.get();
+    float * activation_scale = scale_storage.get() + batch_count * 4;
+
+    CUDA_CHECK(cudaMemsetAsync(
+        scale_storage.get(), 0, batch_count * 8 * sizeof(float), stream));
+    const dim3 grid((unsigned int)blocks, (unsigned int)batch_count, 1);
+    fp8_activation_amax_cuda<<<grid, 256, 0, stream>>>(
+        (const char *)src1->data, activation_amax,
+        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+    quantize_fp8_activation_e4m3_cuda<<<grid, 256, 0, stream>>>(
+        (const char *)src1->data, activation_fp8.get(), activation_amax, activation_scale,
+        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+    CUDA_CHECK(cudaGetLastError());
+
+    cublasLtMatmulDesc_t operation_desc;
+    cublasLtMatrixLayout_t a_desc;
+    cublasLtMatrixLayout_t b_desc;
+    cublasLtMatrixLayout_t c_desc;
+    cublasLtMatrixLayout_t d_desc;
+    const cudaDataType_t a_type = src0->type == GGML_TYPE_F8_E4M3
+        ? CUDA_R_8F_E4M3
+        : CUDA_R_8F_E5M2;
+    const cublasOperation_t trans_a = CUBLAS_OP_T;
+
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&operation_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+        operation_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, a_type, ne00, ne01, ne00));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8F_E4M3, ne10, ne11, ne10));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, ne0, ne1, ne0));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, ne0, ne1, ne0));
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    bool success = true;
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const void * b_scale = activation_scale + batch * 4;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            operation_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale, sizeof(b_scale)));
+
+        const uint8_t * b_ptr = activation_fp8.get() + batch * matrix_size;
+        float * d_ptr = (float *)dst->data + batch * ne0 * ne1;
+        const cublasStatus_t status = cublasLtMatmul(
+            ctx.cublaslt_handle(), operation_desc,
+            &alpha,
+            src0->data, a_desc,
+            b_ptr, b_desc,
+            &beta,
+            d_ptr, c_desc,
+            d_ptr, d_desc,
+            nullptr, nullptr, 0, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            if (status != CUBLAS_STATUS_NOT_SUPPORTED) {
+                CUBLAS_CHECK(status);
+            }
+            success = false;
+            break;
+        }
+    }
+
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(d_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
+    CUBLAS_CHECK(cublasLtMatmulDescDestroy(operation_desc));
+    return success;
+}
+#endif
 
 // Type traits for mapping ggml types to CUDA/cuBLAS types
 template<ggml_type T>
@@ -1667,7 +2376,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
     ggml_type compute_type = src0->type;
-    if (ggml_is_quantized(compute_type)) {
+    if (compute_type == GGML_TYPE_F8_E4M3 || compute_type == GGML_TYPE_F8_E5M2) {
+        compute_type = bf16_mma_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+    } else if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
@@ -1953,6 +2664,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
+
+    if (src0->type == GGML_TYPE_I8) {
+#if !defined(GGML_USE_MUSA)
+        ggml_cuda_mul_mat_i8(ctx, src0, src1, dst);
+#else
+        GGML_ABORT("INT8 tensorwise matmul is only implemented for CUDA and HIP");
+#endif
+        return;
+    }
+
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+    if (ggml_cuda_should_use_fp8_matmul(ctx, src0, src1, dst) &&
+        ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2389,6 +3116,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_QUANTIZE_I8_CONVROT:
+#if !defined(GGML_USE_MUSA)
+            GGML_ASSERT(ggml_cuda_op_quantize_i8_convrot(ctx, dst->src[0], dst, ggml_get_op_params_i32(dst, 0)));
+#else
+            GGML_ABORT("INT8 convrot quantization is only implemented for CUDA and HIP");
+#endif
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -2430,6 +3164,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SOFT_MAX_BACK:
             ggml_cuda_op_soft_max_back(ctx, dst);
+            break;
+        case GGML_OP_ROPE_APPLY:
+            ggml_cuda_op_rope_apply(ctx, dst);
             break;
         case GGML_OP_ROPE:
             ggml_cuda_op_rope(ctx, dst);
@@ -2496,6 +3233,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
+            break;
+        case GGML_OP_SAGE_ATTN:
+            ggml_cuda_sage_attn(ctx, dst);
+            break;
+        case GGML_OP_SOL_ATTN:
+            ggml_cuda_sol_attn(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -5489,7 +6232,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
+                if (a->type == GGML_TYPE_I8) {
+#if !defined(GGML_USE_MUSA)
+                    const ggml_tensor * weight_scale = op->src[2];
+                    const ggml_tensor * bias         = op->src[3];
+                    const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
+                    const bool packed_input          = ggml_mul_mat_has_packed_i8_input(op);
+                    const int cc                     = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    return op->op == GGML_OP_MUL_MAT && (b->type == GGML_TYPE_F32 || packed_input) &&
+                           op->type == GGML_TYPE_F32 && a->ne[0] % 4 == 0 && a->ne[1] % 4 == 0 &&
+                           a->ne[2] == 1 && a->ne[3] == 1 &&
+                           ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
+                           (weight_scale == nullptr ||
+                            (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) &&
+                             ggml_nelements(weight_scale) == a->ne[1])) &&
+                           (bias == nullptr ||
+                            (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                             ggml_nelements(bias) == a->ne[1])) &&
+                           (convrot_group_size == 0 || (convrot_group_size == 256 && a->ne[0] % 256 == 0)) &&
+                           ggml_cuda_i8_blas_available(cc);
+#else
+                    return false;
+#endif
+                }
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
+                    a->type != GGML_TYPE_F8_E4M3 && a->type != GGML_TYPE_F8_E5M2 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
                     return false;
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
@@ -5536,6 +6303,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_F8_E4M3:
+                    case GGML_TYPE_F8_E5M2:
                         return true;
                     default:
                         return false;
@@ -5610,6 +6379,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F16) &&
                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
                 ) {
+                    return true;
+                }
+                if ((src0_type == GGML_TYPE_F8_E4M3 || src0_type == GGML_TYPE_F8_E5M2) &&
+                    (src1_type == GGML_TYPE_F16 || src1_type == GGML_TYPE_BF16)) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {
@@ -5798,6 +6571,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return true;
             }
             return false;
+        case GGML_OP_ROPE_APPLY:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
@@ -5869,6 +6645,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_SAGE_ATTN:
+            return ggml_cuda_sage_attn_supported(dev_ctx->device, op);
+        case GGML_OP_SOL_ATTN:
+            return ggml_cuda_sol_attn_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -5881,6 +6661,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_QUANTIZE_I8_CONVROT:
+#if !defined(GGML_USE_MUSA)
+            {
+                const ggml_tensor * src = op->src[0];
+                const int group_size    = ggml_get_op_params_i32(op, 0);
+                const int64_t rows      = src != nullptr ? ggml_nrows(src) : 0;
+                const int64_t rows_padded = GGML_PAD(rows, 4);
+                const int64_t scale_rows = src != nullptr
+                    ? (rows * (int64_t)sizeof(float) + src->ne[0] - 1) / src->ne[0]
+                    : 0;
+                return src != nullptr && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
+                       ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
+                       group_size == 256 && src->ne[0] % group_size == 0 &&
+                       op->ne[0] == src->ne[0] && op->ne[1] == rows_padded + scale_rows;
+            }
+#else
+            return false;
+#endif
 
         default:
             return false;

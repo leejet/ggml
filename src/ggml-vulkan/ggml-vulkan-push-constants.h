@@ -457,6 +457,21 @@ struct vk_op_diag_mask_push_constants {
     int32_t n_past;
 };
 
+struct vk_op_rope_apply_push_constants {
+    uint32_t half_dim;
+    uint32_t heads;
+    uint32_t tokens;
+    uint32_t pairs;
+    uint32_t x_stride[4];
+    uint32_t pe_stride[4];
+    uint32_t x_offset;
+    uint32_t pe_offset;
+    uint32_t dst_offset;
+    uint32_t interleaved;
+};
+
+static_assert(sizeof(vk_op_rope_apply_push_constants) == 64, "rope_apply push constant layout mismatch");
+
 struct vk_op_rope_push_constants {
     uint32_t rope_mode;
     uint32_t nrows;
@@ -859,6 +874,19 @@ template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p)
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
     uint32_t num_blocks;
+};
+
+struct vk_quantize_i8_convrot_push_constants {
+    uint32_t k;
+    uint32_t rows;
+};
+
+struct vk_mul_mat_i8_tensorwise_push_constants {
+    uint32_t n;
+    uint32_t rows;
+    uint32_t k;
+    uint32_t has_bias;
+    uint32_t row_offset;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {
