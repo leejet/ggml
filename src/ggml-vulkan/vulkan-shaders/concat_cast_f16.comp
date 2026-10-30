@@ -1,0 +1,40 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer A { vec4 data_a[]; };
+layout(binding = 1) readonly buffer B { vec4 data_b[]; };
+layout(binding = 2) writeonly buffer D { f16vec4 data_d[]; };
+layout(push_constant) uniform parameter {
+    uint prefix;
+    uint tokens;
+    uint heads;
+    uint batches;
+    uint a_stride[3];
+    uint b_stride[3];
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
+} p;
+
+void main() {
+    const uint item = gl_GlobalInvocationID.x;
+    const uint token = item / 32;
+    const uint col = item % 32;
+    if (token >= p.tokens) {
+        return;
+    }
+    for (uint hb = gl_WorkGroupID.y; hb < p.heads * p.batches; hb += gl_NumWorkGroups.y) {
+        const uint head = hb % p.heads;
+        const uint batch = hb / p.heads;
+        vec4 value;
+        if (token < p.prefix) {
+            value = data_a[p.a_offset + batch * p.a_stride[2] + head * p.a_stride[1] + token * p.a_stride[0] + col];
+        } else {
+            value = data_b[p.b_offset + batch * p.b_stride[2] + head * p.b_stride[1] + (token - p.prefix) * p.b_stride[0] + col];
+        }
+        data_d[p.d_offset + (hb * p.tokens + token) * 32 + col] = f16vec4(value);
+    }
+}

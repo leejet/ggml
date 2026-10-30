@@ -796,6 +796,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_quantize_i8_convrot_16384;
     vk_pipeline pipeline_sigmoid_quantize_i8_convrot_6144;
     vk_pipeline pipeline_modulate_convrot[2][2];
+    vk_pipeline pipeline_concat_cast_f16;
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2;
@@ -868,6 +869,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_128_f32;
+    vk_pipeline pipeline_rms_rope_apply_f32;
+    vk_pipeline pipeline_rms_norm_mul_128_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -1297,9 +1301,11 @@ struct ggml_backend_vk_context {
     bool fused_i8_swiglu = false;
     bool fused_i8_swiglu_split = false;
     bool fused_i8_residual = false;
+    bool fused_rms_rope_apply = false;
     bool fused_modulate_convrot = false;
     bool fused_swiglu_convrot = false;
     bool fused_sigmoid_convrot = false;
+    bool fused_concat_cast_f16 = false;
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
