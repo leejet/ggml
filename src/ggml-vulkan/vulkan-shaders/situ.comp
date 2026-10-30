@@ -1,5 +1,9 @@
 #version 450
 
+#ifdef SITU_PACK_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
 #include "glu_head.glsl"
 
 shared float scaled_up_values[512];
