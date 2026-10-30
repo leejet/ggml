@@ -471,6 +471,21 @@ struct vk_op_rope_apply_push_constants {
     uint32_t interleaved;
 };
 
+struct vk_op_rms_norm_mul_rope_apply_push_constants {
+    uint32_t heads;
+    uint32_t tokens;
+    uint32_t batches;
+    uint32_t x_stride[3];
+    uint32_t pe_stride[4];
+    uint32_t x_offset;
+    uint32_t weight_offset;
+    uint32_t pe_offset;
+    uint32_t dst_offset;
+    float eps;
+};
+
+static_assert(sizeof(vk_op_rms_norm_mul_rope_apply_push_constants) == 60, "rms_norm_mul_rope_apply push constant layout mismatch");
+
 static_assert(sizeof(vk_op_rope_apply_push_constants) == 68, "rope_apply push constant layout mismatch");
 
 struct vk_op_rope_push_constants {

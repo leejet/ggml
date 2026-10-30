@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer W { float data_w[]; };
+layout(binding = 2) readonly buffer PE { float data_pe[]; };
+layout(binding = 3) writeonly buffer D { D_TYPE data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint heads;
+    uint tokens;
+    uint batches;
+    uint x_stride[3];
+    uint pe_stride[4];
+    uint x_offset;
+    uint weight_offset;
+    uint pe_offset;
+    uint dst_offset;
+    float eps;
+} p;
+
+void main() {
+    const uint head = gl_WorkGroupID.x * 4 + gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    if (head >= p.heads) {
+        return;
+    }
+    for (uint batch = gl_WorkGroupID.z; batch < p.batches; batch += gl_NumWorkGroups.z) {
+        for (uint token = gl_WorkGroupID.y; token < p.tokens; token += gl_NumWorkGroups.y) {
+            const uint input_offset = p.x_offset + head * p.x_stride[0] + token * p.x_stride[1] + batch * p.x_stride[2];
+            float values[4];
+            precise float squares[4];
+            for (uint i = 0; i < 4; ++i) {
+                values[i] = data_x[input_offset + lane + 32 * i];
+                squares[i] = values[i] * values[i];
+            }
+            // Match the original 512-thread RMS tree before separately rounded scaling and rotation.
+            precise float sum = (squares[0] + squares[2]) + (squares[1] + squares[3]);
+            for (uint step = 16; step > 0; step >>= 1) {
+                sum = sum + subgroupShuffleXor(sum, step);
+            }
+            sum = subgroupShuffle(sum, 0);
+            const float scale = inversesqrt(sum / 128.0f + p.eps);
+            precise float weighted[4];
+            for (uint i = 0; i < 4; ++i) {
+                precise float normalized = scale * values[i];
+                weighted[i] = normalized * data_w[p.weight_offset + lane + 32 * i];
+            }
+            const uint output_offset = p.dst_offset + ((batch * p.heads + head) * p.tokens + token) * 128;
+            for (uint i = 0; i < 2; ++i) {
+                const uint col = lane + 32 * i;
+                const uint matrix = p.pe_offset + col * p.pe_stride[2] + token * p.pe_stride[3];
+                const float c = data_pe[matrix];
+                const float s = data_pe[matrix + p.pe_stride[1]];
+                precise float y0 = weighted[i] * c - weighted[i + 2] * s;
+                precise float y1 = weighted[i] * s + weighted[i + 2] * c;
+                data_d[output_offset + col] = D_TYPE(y0);
+                data_d[output_offset + col + 64] = D_TYPE(y1);
+            }
+        }
+    }
+}
