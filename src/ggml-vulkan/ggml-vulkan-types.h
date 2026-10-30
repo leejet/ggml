@@ -745,6 +745,8 @@ struct vk_device_struct {
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
+    bool coopmat2_i8_support {};
+    bool coopmat2_i8_small_support {};
     bool coopmat2_decode_vector;
 
     bool dot2_f16 {};
@@ -790,6 +792,15 @@ struct vk_device_struct {
     vk_pipeline pipeline_quantize_i8_convrot;
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
+    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2;
+    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2_aligned[2];
+    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2_tail;
+    vk_pipeline pipeline_mul_mat_i8_swiglu_cm2[2];
+    vk_pipeline pipeline_mul_mat_i8_residual_cm2[3];
+    vk_pipeline pipeline_mul_mat_i8_residual_cm2_tail;
+    vk_pipeline pipeline_mul_mat_i8_swiglu_cm2_tail;
+    vk_pipeline pipeline_mul_mat_i8_swiglu_split_cm2[2];
+    vk_pipeline pipeline_mul_mat_i8_swiglu_split_cm2_tail;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1277,6 +1288,9 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+    bool fused_i8_swiglu = false;
+    bool fused_i8_swiglu_split = false;
+    bool fused_i8_residual = false;
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.

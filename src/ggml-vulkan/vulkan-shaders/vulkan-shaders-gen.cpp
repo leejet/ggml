@@ -960,6 +960,11 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm1.comp", {}, true, true);
 #endif
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm2.comp", {}, true, false, true);
+    string_to_spv("mul_mat_i8_swiglu_split", "mul_mat_i8_tensorwise_cm2.comp", {{"SPLIT_SWIGLU", "1"}}, true, false, true);
+    string_to_spv("mul_mat_i8_residual", "mul_mat_i8_tensorwise_cm2.comp", {{"RESIDUAL", "1"}}, true, false, true);
+#endif
 #endif
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

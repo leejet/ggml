@@ -3246,6 +3246,32 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->integer_dot_product) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot, "quantize_i8_convrot", quantize_i8_convrot_len, quantize_i8_convrot_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise, "mul_mat_i8_tensorwise", mul_mat_i8_tensorwise_len, mul_mat_i8_tensorwise_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {16, 16, 1}, {}, 1);
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+        if (device->coopmat2 && device->coopmat2_i8_support) {
+            const uint32_t bk = 128;
+            ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise_cm2, "mul_mat_i8_tensorwise_cm2", mul_mat_i8_tensorwise_cm2_len, mul_mat_i8_tensorwise_cm2_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {128, 64, 1}, {64, 0}, 1);
+            for (uint32_t index = 0; index < 2; ++index) {
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise_cm2_aligned[index], "mul_mat_i8_tensorwise_cm2_aligned", mul_mat_i8_tensorwise_cm2_len, mul_mat_i8_tensorwise_cm2_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {128, 128, 1}, {128, 1, 0, 128, 64u << index}, 1);
+            }
+            if (device->coopmat2_i8_small_support) {
+                // Narrow column tiles keep short row tails distributed across more workgroups.
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise_cm2_tail, "mul_mat_i8_tensorwise_cm2_tail", mul_mat_i8_tensorwise_cm2_len, mul_mat_i8_tensorwise_cm2_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {64, 32, 1}, {32, 2, 0, 64, 256}, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_residual_cm2_tail, "mul_mat_i8_residual_cm2_tail", mul_mat_i8_residual_cm2_len, mul_mat_i8_residual_cm2_data, "main", 8, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {64, 32, 1}, {32, 2, 0, 64, 256}, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_swiglu_cm2_tail, "mul_mat_i8_swiglu_cm2_tail", mul_mat_i8_tensorwise_cm2_len, mul_mat_i8_tensorwise_cm2_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {64, 32, 1}, {32, 2, 1, 64, 256}, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_swiglu_split_cm2_tail, "mul_mat_i8_swiglu_split_cm2_tail", mul_mat_i8_swiglu_split_cm2_len, mul_mat_i8_swiglu_split_cm2_data, "main", 8, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {64, 32, 1}, {32, 2, 1, 64, 256}, 1);
+            }
+            ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_residual_cm2[2], "mul_mat_i8_residual_cm2", mul_mat_i8_residual_cm2_len, mul_mat_i8_residual_cm2_data, "main", 8, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {128, 128, 1}, {128, 1, 0, 128, 64}, 1);
+            for (uint32_t aligned = 0; aligned < 2; ++aligned) {
+                const uint32_t residual_rows = aligned ? 128 : 64;
+                const uint32_t residual_cols = 128;
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_residual_cm2[aligned], "mul_mat_i8_residual_cm2", mul_mat_i8_residual_cm2_len, mul_mat_i8_residual_cm2_data, "main", 8, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {residual_cols, residual_rows, 1}, {residual_rows, aligned, 0, residual_cols, aligned ? bk : 64}, 1);
+                if (device->coopmat2_i8_small_support) {
+                    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_swiglu_cm2[aligned], "mul_mat_i8_swiglu_cm2", mul_mat_i8_tensorwise_cm2_len, mul_mat_i8_tensorwise_cm2_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {64, 128, 1}, {128, aligned, 1, 64, aligned ? bk : 64}, 1);
+                    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_swiglu_split_cm2[aligned], "mul_mat_i8_swiglu_split_cm2", mul_mat_i8_swiglu_split_cm2_len, mul_mat_i8_swiglu_split_cm2_data, "main", 8, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {64, 128, 1}, {128, aligned, 1, 64, aligned ? bk : 64}, 1);
+                }
+            }
+        }
+#endif
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (device->coopmat_int_support) {
             ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise_cm1, "mul_mat_i8_tensorwise_cm1", mul_mat_i8_tensorwise_cm1_len, mul_mat_i8_tensorwise_cm1_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {4 * device->coopmat_int_n, 4 * device->coopmat_int_m, 1}, {device->subgroup_size, device->coopmat_int_m, device->coopmat_int_n, device->coopmat_int_k}, 1, true, true, device->subgroup_size);
@@ -4595,6 +4621,20 @@ vk_device ggml_vk_get_device(size_t idx) {
                 for (auto &prop : flexible_dimensions) {
                     if (prop.saturatingAccumulation == VK_FALSE &&
                         prop.scope == VK_SCOPE_WORKGROUP_KHR) {
+
+                        if (prop.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                            prop.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                            prop.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
+                            prop.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
+                            prop.workgroupInvocations == 128 &&
+                            128 % prop.MGranularity == 0 &&
+                            64 % prop.NGranularity == 0 &&
+                            64 % prop.KGranularity == 0) {
+                            device->coopmat2_i8_support = true;
+                            if (32 % prop.NGranularity == 0 && 64 % prop.MGranularity == 0) {
+                                device->coopmat2_i8_small_support = true;
+                            }
+                        }
 
                         if (prop.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                             prop.BType == VK_COMPONENT_TYPE_FLOAT16_KHR) {
@@ -7413,7 +7453,8 @@ static void ggml_vk_quantize_i8_convrot(
 
 static void ggml_vk_mul_mat_i8_tensorwise(
         ggml_backend_vk_context * ctx, vk_context & subctx,
-        const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst) {
+        const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst, ggml_tensor * output = nullptr,
+        const ggml_tensor * gate = nullptr, const ggml_tensor * residual = nullptr, float output_scale = 1.0f, const ggml_tensor * up_mat = nullptr) {
     GGML_ASSERT(ggml_vk_can_use_mul_mat_i8_tensorwise(ctx->device, dst));
     const uint32_t rows = (uint32_t) ggml_nrows(dst);
     uint32_t coop_rows = 0;
@@ -7442,25 +7483,63 @@ static void ggml_vk_mul_mat_i8_tensorwise(
     const vk_subbuffer bias_buf = bias != nullptr
         ? ggml_vk_tensor_subbuffer(ctx, bias)
         : weight_scales_buf;
-    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, output != nullptr ? output : dst);
     const auto dispatch = [&](vk_pipeline pipeline, uint32_t row_offset, uint32_t dispatch_rows) {
         if (dispatch_rows == 0) {
             return;
         }
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         const vk_mul_mat_i8_tensorwise_push_constants pc = {
-            (uint32_t) weight->ne[1],
+            (uint32_t) weight->ne[1] * (up_mat != nullptr ? 2u : 1u),
             rows,
             (uint32_t) weight->ne[0],
             bias != nullptr ? 1u : 0u,
             row_offset,
+            output_scale,
         };
+        if (up_mat != nullptr) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                {weight_buf, quantized_buf, weight_scales_buf, activation_scales_buf, bias_buf, dst_buf,
+                 ggml_vk_tensor_subbuffer(ctx, up_mat->src[0]), ggml_vk_tensor_subbuffer(ctx, up_mat->src[2])},
+                pc, {(uint32_t)output->ne[0], dispatch_rows, 1});
+            return;
+        }
+        if (residual != nullptr) {
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, pipeline,
+                { weight_buf, quantized_buf, weight_scales_buf, activation_scales_buf, bias_buf, dst_buf,
+                  ggml_vk_tensor_subbuffer(ctx, gate), ggml_vk_tensor_subbuffer(ctx, residual) },
+                pc, { (uint32_t) weight->ne[1], dispatch_rows, 1 });
+            return;
+        }
         ggml_vk_dispatch_pipeline(
             ctx, subctx, pipeline,
             { weight_buf, quantized_buf, weight_scales_buf, activation_scales_buf, bias_buf, dst_buf },
-            pc, { (uint32_t) weight->ne[1], dispatch_rows, 1 });
+            pc, { (uint32_t) (output != nullptr ? output->ne[0] : weight->ne[1]), dispatch_rows, 1 });
     };
 
+    if (ctx->device->pipeline_mul_mat_i8_tensorwise_cm2) {
+        if (residual != nullptr) {
+            const uint32_t full_rows = weight->ne[1] % 128 == 0 ? rows / 128 * 128 : 0;
+            dispatch(ctx->device->pipeline_mul_mat_i8_residual_cm2[weight->ne[0] % 4096 == 0 ? 1 : 2], 0, full_rows);
+            auto tail = ctx->device->pipeline_mul_mat_i8_residual_cm2_tail;
+            dispatch(tail && weight->ne[1] % 128 == 0 && rows - full_rows <= 32 ? tail : ctx->device->pipeline_mul_mat_i8_residual_cm2[0], full_rows, rows - full_rows);
+            return;
+        }
+        if (output != nullptr) {
+            const uint32_t full_rows = rows / 128 * 128;
+            dispatch(up_mat ? ctx->device->pipeline_mul_mat_i8_swiglu_split_cm2[1] : ctx->device->pipeline_mul_mat_i8_swiglu_cm2[1], 0, full_rows);
+            auto tail = up_mat ? ctx->device->pipeline_mul_mat_i8_swiglu_split_cm2_tail : ctx->device->pipeline_mul_mat_i8_swiglu_cm2_tail;
+            auto fallback = up_mat ? ctx->device->pipeline_mul_mat_i8_swiglu_split_cm2[0] : ctx->device->pipeline_mul_mat_i8_swiglu_cm2[0];
+            dispatch(tail && rows - full_rows <= 32 ? tail : fallback, full_rows, rows - full_rows);
+            return;
+        }
+        const uint32_t full_rows = weight->ne[1] % 128 == 0 ? rows / 128 * 128 : 0;
+        dispatch(ctx->device->pipeline_mul_mat_i8_tensorwise_cm2_aligned[weight->ne[0] % 4096 == 0 ? 1 : 0], 0, full_rows);
+        auto tail = ctx->device->pipeline_mul_mat_i8_tensorwise_cm2_tail;
+        dispatch(tail && weight->ne[1] % 128 == 0 && rows - full_rows <= 32 ? tail : ctx->device->pipeline_mul_mat_i8_tensorwise_cm2, full_rows, rows - full_rows);
+        return;
+    }
     if (coop_rows > 0) {
         dispatch(ctx->device->pipeline_mul_mat_i8_tensorwise_cm1, 0, coop_rows);
     }
@@ -12985,7 +13064,21 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_MUL_MAT:
         if (src0->type == GGML_TYPE_I8) {
-            ggml_vk_mul_mat_i8_tensorwise(ctx, compute_ctx, src0, src1, node);
+            if (ctx->fused_i8_swiglu_split) {
+                ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+                ggml_tensor * mat = glu->src[0];
+                ggml_vk_mul_mat_i8_tensorwise(ctx, compute_ctx, mat->src[0], mat->src[1], mat, glu, nullptr, nullptr, 1.0f, glu->src[1]);
+            } else if (ctx->fused_i8_residual) {
+                const int last = node_idx + ctx->num_additional_fused_ops;
+                ggml_tensor * mul = cgraph->nodes[last - 1];
+                ggml_tensor * output = cgraph->nodes[last];
+                const ggml_tensor * residual = output->src[0] == mul ? output->src[1] : output->src[0];
+                const float scale = ctx->num_additional_fused_ops == 3 ? ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 0) : 1.0f;
+                ggml_vk_mul_mat_i8_tensorwise(ctx, compute_ctx, src0, src1, node, output, mul->src[1], residual, scale);
+            } else {
+                ggml_vk_mul_mat_i8_tensorwise(ctx, compute_ctx, src0, src1, node,
+                    ctx->fused_i8_swiglu ? cgraph->nodes[node_idx + 1] : nullptr);
+            }
         } else {
             ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
         }
@@ -13789,6 +13882,125 @@ static bool ggml_vk_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int un
         return ggml_can_repeat(other, unary);
     }
     return ggml_can_repeat(unary, mul->src[0]);
+}
+
+static bool ggml_vk_match_i8_swiglu_split(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i, int * indices) {
+    if (i < 2 || i >= graph->n_nodes || !ctx->device->pipeline_mul_mat_i8_swiglu_split_cm2[0]) {
+        return false;
+    }
+    const ggml_tensor * glu = graph->nodes[i];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr || glu->ne[0] % 128 != 0 ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+        glu->view_offs % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+        return false;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up = glu->src[1];
+    if (gate == up || gate->src[1] != up->src[1] || !ggml_are_same_shape(gate, up)) {
+        return false;
+    }
+    for (auto mat : {gate, up}) {
+        if (mat->op != GGML_OP_MUL_MAT || mat->view_src != nullptr || mat->src[3] != nullptr ||
+            !ggml_vk_can_use_mul_mat_i8_tensorwise(ctx->device, mat)) {
+            return false;
+        }
+    }
+    int found = 0;
+    for (int j = std::max(0, i - 32); j < i; ++j) {
+        if (graph->nodes[j] == gate || graph->nodes[j] == up) {
+            indices[found++] = j;
+        }
+    }
+    if (found != 2) {
+        return false;
+    }
+    indices[2] = i;
+    const ggml_op ops[] = {GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU};
+    return ggml_can_fuse_subgraph_ext(graph, indices, 3, ops, &i, 1);
+}
+
+static bool ggml_vk_can_fuse_i8_swiglu_split(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    int indices[3];
+    return ggml_vk_match_i8_swiglu_split(ctx, graph, i + 2, indices) && indices[0] == i && indices[1] == i + 1;
+}
+
+static bool ggml_vk_can_fuse_i8_swiglu(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (i + 1 >= graph->n_nodes || !ctx->device->pipeline_mul_mat_i8_swiglu_cm2[0]) {
+        return false;
+    }
+    const ggml_tensor * mat = graph->nodes[i];
+    const ggml_tensor * glu = graph->nodes[i + 1];
+    return mat->op == GGML_OP_MUL_MAT && ggml_vk_can_use_mul_mat_i8_tensorwise(ctx->device, mat) &&
+        mat->view_src == nullptr && mat->src[3] == nullptr && mat->ne[0] % 256 == 0 &&
+        glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+        ggml_get_op_params_i32(glu, 1) == 0 && glu->src[0] == mat && glu->src[1] == nullptr &&
+        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
+        glu->view_offs % ctx->device->properties.limits.minStorageBufferOffsetAlignment == 0 &&
+        ggml_can_fuse_subgraph(graph, i, {GGML_OP_MUL_MAT, GGML_OP_GLU}, {i + 1});
+}
+
+static int ggml_vk_match_i8_residual(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int add_idx, int * indices) {
+    if (add_idx < 2 || add_idx >= graph->n_nodes || !ctx->device->pipeline_mul_mat_i8_residual_cm2[0]) {
+        return 0;
+    }
+    const ggml_tensor * dst = graph->nodes[add_idx];
+    if (dst->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const ggml_tensor * mul = dst->src[0]->op == GGML_OP_MUL ? dst->src[0] : dst->src[1];
+    if (mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * scaled_mat = mul->src[0];
+    const bool scaled = scaled_mat->op == GGML_OP_SCALE;
+    const ggml_tensor * mat = scaled ? scaled_mat->src[0] : scaled_mat;
+    if (mat->op != GGML_OP_MUL_MAT || !ggml_vk_can_use_mul_mat_i8_tensorwise(ctx->device, mat) || mat->src[3] != nullptr ||
+        (scaled && ggml_get_op_params_f32(scaled_mat, 1) != 0.0f)) {
+        return 0;
+    }
+    const int count = scaled ? 4 : 3;
+    const ggml_tensor * nodes[4] = {mat, scaled ? scaled_mat : mul, scaled ? mul : dst, dst};
+    ggml_op ops[4];
+    const ggml_tensor * gate = mul->src[1];
+    const ggml_tensor * residual = dst->src[0] == mul ? dst->src[1] : dst->src[0];
+    if (!ggml_are_same_shape(mat, dst) || !ggml_are_same_shape(residual, dst) ||
+        gate->ne[0] != mat->ne[0] || ggml_nelements(gate) != mat->ne[0]) {
+        return 0;
+    }
+    for (const ggml_tensor * tensor : {mat, scaled_mat, mul, gate, residual, dst}) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+            tensor->view_offs % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+            return 0;
+        }
+    }
+    for (int j = 0; j < count; ++j) {
+        ops[j] = nodes[j]->op;
+    }
+    int next = count - 1;
+    for (int j = add_idx; j >= std::max(0, add_idx - 32) && next >= 0; --j) {
+        if (graph->nodes[j] == nodes[next]) {
+            indices[next--] = j;
+        }
+    }
+    return next < 0 && ggml_can_fuse_subgraph_ext(graph, indices, count, ops, &add_idx, 1) ? count : 0;
+}
+
+static int ggml_vk_can_fuse_i8_residual(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (i + 2 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const int count = graph->nodes[i + 1]->op == GGML_OP_SCALE ? 4 : 3;
+    int indices[4];
+    if (ggml_vk_match_i8_residual(ctx, graph, i + count - 1, indices) != count) {
+        return 0;
+    }
+    for (int j = 0; j < count; ++j) {
+        if (indices[j] != i + j) {
+            return 0;
+        }
+    }
+    return count;
 }
 
 static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14659,6 +14871,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // The array is sized to handle the largest fusion (asserted later).
         bool op_srcs_fused_elementwise[13];
 
+        ctx->fused_i8_swiglu = false;
+        ctx->fused_i8_swiglu_split = false;
+        ctx->fused_i8_residual = false;
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
@@ -14671,6 +14886,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (int count = ggml_vk_can_fuse_i8_residual(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = count - 1;
+                ctx->fused_i8_residual = true;
+                fusion_string = "MUL_MAT_I8_RESIDUAL";
+                std::fill_n(op_srcs_fused_elementwise, count, false);
+                op_srcs_fused_elementwise[count - 1] = true;
+            } else if (ggml_vk_can_fuse_i8_swiglu_split(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_i8_swiglu_split = true;
+                fusion_string = "MUL_MAT_I8_SWIGLU_SPLIT";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse_i8_swiglu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_i8_swiglu = true;
+                fusion_string = "MUL_MAT_I8_SWIGLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -14899,6 +15131,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
             }
             if (need_disable) {
+                ctx->fused_i8_swiglu = false;
+                ctx->fused_i8_swiglu_split = false;
+                ctx->fused_i8_residual = false;
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
@@ -14908,6 +15143,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
+        }
+
+        if (ctx->fused_i8_swiglu_split) {
+            const uint64_t up_flops = ggml_vk_get_node_flops(cgraph->nodes[i + 1]);
+            batch_flops += up_flops;
+            total_flops += up_flops;
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
@@ -16815,6 +17056,9 @@ void vk_perf_logger::print_timings(bool force) {
 
 std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
     *n_flops = ggml_vk_get_node_flops(node);
+    if (fusion_name && strcmp(fusion_name, "MUL_MAT_I8_SWIGLU_SPLIT") == 0) {
+        *n_flops *= 2;
+    }
     std::string fusion_str;
     if (fusion_name) {
         fusion_str = fusion_name + std::string(" ");
