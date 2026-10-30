@@ -1234,6 +1234,7 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    bool serialize_graph_submissions{};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -1297,6 +1298,10 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    bool serialized_submissions() const {
+        return device->serialize_submissions || serialize_graph_submissions;
+    }
 };
 
 struct ggml_backend_vk_buffer_context {

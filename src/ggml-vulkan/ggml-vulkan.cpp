@@ -12443,8 +12443,15 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     if (subctx) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
-        ggml_vk_submit(subctx, {});
-        ctx->submit_pending = true;
+        if (ctx->serialized_submissions()) {
+            ggml_vk_submit(subctx, ctx->fence);
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "preallocate waitForFences", ctx->device);
+            ctx->device->device.resetFences({ ctx->fence });
+            ctx->submit_pending = false;
+        } else {
+            ggml_vk_submit(subctx, {});
+            ctx->submit_pending = true;
+        }
         ggml_vk_synchronize(ctx);
         GGML_ASSERT(ctx->compute_ctx.expired());
         ggml_vk_ctx_begin(ctx->device, subctx);
@@ -13101,7 +13108,7 @@ void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             memset(mset.dst, mset.val, mset.n);
         }
 
-        if (ctx->device->serialize_submissions) {
+        if (ctx->serialized_submissions()) {
             ggml_vk_submit(subctx, ctx->fence);
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
@@ -13700,7 +13707,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
 
-        if (ctx->device->serialize_submissions) {
+        if (ctx->serialized_submissions()) {
             ggml_vk_submit(compute_ctx, ctx->fence);
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
@@ -13711,7 +13718,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 
     if (ctx->submit_pending) {
-        if (ctx->device->serialize_submissions) {
+        if (ctx->serialized_submissions()) {
             ctx->submit_pending = false;
         } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
@@ -13730,7 +13737,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         } else {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
-        if (!ctx->device->serialize_submissions) {
+        if (!ctx->serialized_submissions()) {
             ggml_vk_wait_for_fence(ctx);
         }
         ctx->submit_pending = false;
@@ -14506,6 +14513,30 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->device->diag_prev_start = -1;
     ctx->device->diag_prev_end = -1;
 
+    bool serialize_graph = false;
+    if (ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->coopmat2) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+                continue;
+            }
+            const ggml_tensor * q = node->src[0];
+            const ggml_tensor * k = node->src[1];
+            const ggml_tensor * v = node->src[2];
+            if (q->ne[0] == 128 && q->ne[1] >= 4096 && q->ne[2] == 24 && q->ne[3] == 1 &&
+                k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v) && node->src[3] == nullptr) {
+                serialize_graph = true;
+                break;
+            }
+        }
+    }
+    if (serialize_graph != ctx->serialize_graph_submissions) {
+        // Finish transfers and batches submitted with the previous fence policy first.
+        ggml_vk_synchronize(ctx);
+        ctx->serialize_graph_submissions = serialize_graph;
+    }
+
     if (vk_instance.debug_utils_support) {
         ctx->device->debug_cmdbuf_idx = 0;
     }
@@ -14597,7 +14628,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
     auto const submit_after = [&](int start, int end) {
-        if (ctx->device->serialize_submissions) {
+        if (ctx->serialized_submissions()) {
             try {
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {
