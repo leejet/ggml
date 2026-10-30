@@ -3245,6 +3245,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     if (device->integer_dot_product) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot, "quantize_i8_convrot", quantize_i8_convrot_len, quantize_i8_convrot_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1);
+        for (uint32_t affine = 0; affine < 2; ++affine) {
+            for (uint32_t index = 0; index < 2; ++index) {
+                const uint32_t cols = index == 0 ? 4096 : 6144;
+                if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+                    device->properties.limits.maxComputeSharedMemorySize >= (cols + 1024) * sizeof(float)) {
+                    ggml_vk_create_pipeline(device, device->pipeline_modulate_convrot[affine][index], "modulate_convrot", modulate_convrot_len, modulate_convrot_data, "main", 5, sizeof(vk_modulate_convrot_push_constants), {1, 1, 1}, {cols, affine}, 1);
+                }
+            }
+        }
+        if (device->subgroup_size == 32 && device->subgroup_require_full_support && device->subgroup_shuffle && device->subgroup_arithmetic && device->properties.limits.maxComputeWorkGroupInvocations >= 256) {
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot_subgroup, "quantize_i8_convrot_subgroup", quantize_i8_convrot_subgroup_len, quantize_i8_convrot_subgroup_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_i8_convrot, "swiglu_quantize_i8_convrot", swiglu_quantize_i8_convrot_len, swiglu_quantize_i8_convrot_data, "main", 4, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            const uint64_t lengths[] = {quantize_i8_convrot_register_4096_len, quantize_i8_convrot_register_6144_len, quantize_i8_convrot_register_12288_len, quantize_i8_convrot_register_16384_len};
+            const unsigned char * data[] = {quantize_i8_convrot_register_4096_data, quantize_i8_convrot_register_6144_data, quantize_i8_convrot_register_12288_data, quantize_i8_convrot_register_16384_data};
+            for (uint32_t index = 0; index < 4; ++index) {
+                ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot_register[index], "quantize_i8_convrot_register", lengths[index], data[index], "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            }
+            ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_i8_convrot_16384, "swiglu_quantize_i8_convrot_16384", swiglu_quantize_i8_convrot_16384_len, swiglu_quantize_i8_convrot_16384_data, "main", 4, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            ggml_vk_create_pipeline(device, device->pipeline_sigmoid_quantize_i8_convrot_6144, "sigmoid_quantize_i8_convrot_6144", sigmoid_quantize_i8_convrot_6144_len, sigmoid_quantize_i8_convrot_6144_data, "main", 4, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        }
         ggml_vk_create_pipeline(device, device->pipeline_mul_mat_i8_tensorwise, "mul_mat_i8_tensorwise", mul_mat_i8_tensorwise_len, mul_mat_i8_tensorwise_data, "main", 6, sizeof(vk_mul_mat_i8_tensorwise_push_constants), {16, 16, 1}, {}, 1);
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
         if (device->coopmat2 && device->coopmat2_i8_support) {
@@ -7424,11 +7444,50 @@ static bool ggml_vk_can_use_mul_mat_i8_tensorwise(const vk_device & device, cons
 #endif
 }
 
+static void ggml_vk_modulate_convrot(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * graph, int i) {
+    const ggml_tensor * first = graph->nodes[i];
+    const ggml_tensor * x = first->src[0];
+    const bool affine = first->op == GGML_OP_MUL;
+    const ggml_tensor * mod = graph->nodes[i + (affine ? 0 : 1)]->src[1];
+    const ggml_tensor * shift = affine ? graph->nodes[i + 2]->src[1] : mod;
+    const ggml_tensor * dst = graph->nodes[i + (affine ? 3 : 2)];
+    auto pipeline = ctx->device->pipeline_modulate_convrot[affine][x->ne[0] == 4096 ? 0 : 1];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t rows = (uint32_t) ggml_nrows(x);
+    const auto out = ggml_vk_tensor_subbuffer(ctx, dst);
+    const uint64_t scale_offset = (uint64_t) x->ne[0] * GGML_PAD((uint64_t) rows, 4);
+    const vk_subbuffer packed = {out.buffer, out.offset, scale_offset};
+    const vk_subbuffer scales = {out.buffer, out.offset + scale_offset, rows * sizeof(float)};
+    const vk_modulate_convrot_push_constants pc = {
+        rows, uint32_t(get_misalign_bytes(ctx, x) / sizeof(float)), uint32_t(get_misalign_bytes(ctx, mod) / sizeof(float)),
+        uint32_t(get_misalign_bytes(ctx, shift) / sizeof(float)), affine ? 0.0f : ggml_get_op_params_f32(first, 0), uint32_t(x->ne[0]),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, mod, true),
+         ggml_vk_tensor_subbuffer(ctx, shift, true), packed, scales},
+        pc, {std::min(rows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]), 1, 1});
+}
+
 static void ggml_vk_quantize_i8_convrot(
         ggml_backend_vk_context * ctx, vk_context & subctx,
-        const ggml_tensor * src, ggml_tensor * dst) {
+        const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * up = nullptr, bool sigmoid = false) {
     GGML_ASSERT(ggml_vk_can_use_quantize_i8_convrot(ctx->device, dst));
     vk_pipeline pipeline = ctx->device->pipeline_quantize_i8_convrot;
+    if (src->ne[0] >= 1024 && ctx->device->pipeline_quantize_i8_convrot_subgroup) {
+        pipeline = ctx->device->pipeline_quantize_i8_convrot_subgroup;
+    }
+    for (int index = 0; index < 4; ++index) {
+        const int64_t cols[] = {4096, 6144, 12288, 16384};
+        if (src->ne[0] == cols[index] && ctx->device->pipeline_quantize_i8_convrot_register[index]) {
+            pipeline = ctx->device->pipeline_quantize_i8_convrot_register[index];
+        }
+    }
+    if (up != nullptr) {
+        pipeline = src->ne[0] == 16384 ? ctx->device->pipeline_swiglu_quantize_i8_convrot_16384 : ctx->device->pipeline_swiglu_quantize_i8_convrot;
+    }
+    if (sigmoid) {
+        pipeline = ctx->device->pipeline_sigmoid_quantize_i8_convrot_6144;
+    }
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t rows = (uint32_t) ggml_nrows(src);
@@ -7447,8 +7506,11 @@ static void ggml_vk_quantize_i8_convrot(
         rows,
     };
     const uint32_t workgroups = std::min(rows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
-    ggml_vk_dispatch_pipeline(
-        ctx, subctx, pipeline, { src_buf, quantized_buf, scales_buf }, pc, { workgroups, 1, 1 });
+    if (up != nullptr) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {src_buf, quantized_buf, scales_buf, ggml_vk_tensor_subbuffer(ctx, up)}, pc, {workgroups, 1, 1});
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {src_buf, quantized_buf, scales_buf}, pc, {workgroups, 1, 1});
+    }
 }
 
 static void ggml_vk_mul_mat_i8_tensorwise(
@@ -12748,7 +12810,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_modulate_convrot) {
+            ggml_vk_modulate_convrot(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -12851,7 +12915,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_NORM:
-        ggml_vk_norm(ctx, compute_ctx, src0, node);
+        if (ctx->fused_modulate_convrot) {
+            ggml_vk_modulate_convrot(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_norm(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_GROUP_NORM:
@@ -12870,6 +12938,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_UNARY:
+        if (ctx->fused_sigmoid_convrot) {
+            ggml_vk_quantize_i8_convrot(ctx, compute_ctx, src0, cgraph->nodes[node_idx + 2], cgraph->nodes[node_idx + 1]->src[0], true);
+            break;
+        }
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -12911,6 +12983,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         break;
     case GGML_OP_GLU:
+        if (ctx->fused_swiglu_convrot) {
+            ggml_vk_quantize_i8_convrot(ctx, compute_ctx, src0, cgraph->nodes[node_idx + 1], src1);
+            break;
+        }
         switch (ggml_get_glu_op(node)) {
         case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_REGLU:
@@ -13882,6 +13958,123 @@ static bool ggml_vk_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int un
         return ggml_can_repeat(other, unary);
     }
     return ggml_can_repeat(unary, mul->src[0]);
+}
+
+static bool ggml_vk_can_fuse_sigmoid_convrot(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (i + 2 >= graph->n_nodes || !ctx->device->pipeline_sigmoid_quantize_i8_convrot_6144) {
+        return false;
+    }
+    const ggml_tensor * sigmoid = graph->nodes[i];
+    const ggml_tensor * mul = graph->nodes[i + 1];
+    const ggml_tensor * quant = graph->nodes[i + 2];
+    if (sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+        mul->op != GGML_OP_MUL || mul->src[1] != sigmoid ||
+        quant->op != GGML_OP_QUANTIZE_I8_CONVROT || quant->src[0] != mul ||
+        sigmoid->ne[0] != 6144 || !ggml_are_same_shape(sigmoid, mul->src[0]) ||
+        !ggml_vk_can_use_quantize_i8_convrot(ctx->device, quant)) {
+        return false;
+    }
+    for (const ggml_tensor * tensor : {sigmoid->src[0], mul->src[0]}) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+            tensor->view_offs % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+            return false;
+        }
+    }
+    return ggml_can_fuse_subgraph(graph, i, {GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_QUANTIZE_I8_CONVROT}, {i + 2});
+}
+
+static bool ggml_vk_can_fuse_swiglu_convrot(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (i + 1 >= graph->n_nodes || !ctx->device->pipeline_swiglu_quantize_i8_convrot) {
+        return false;
+    }
+    const ggml_tensor * glu = graph->nodes[i];
+    const ggml_tensor * quant = graph->nodes[i + 1];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0 ||
+        quant->op != GGML_OP_QUANTIZE_I8_CONVROT || quant->src[0] != glu ||
+        !ggml_vk_can_use_quantize_i8_convrot(ctx->device, quant) || !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu->src[1])) {
+        return false;
+    }
+    for (const ggml_tensor * tensor : {glu->src[0], glu->src[1]}) {
+        if (tensor->type != GGML_TYPE_F32 || tensor->view_offs % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+            return false;
+        }
+    }
+    return ggml_can_fuse_subgraph(graph, i, {GGML_OP_GLU, GGML_OP_QUANTIZE_I8_CONVROT}, {i + 1});
+}
+
+static int ggml_vk_match_modulate_convrot(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int quant_idx, int * indices) {
+    if (quant_idx < 1 || quant_idx >= graph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * quant = graph->nodes[quant_idx];
+    if (quant->op != GGML_OP_QUANTIZE_I8_CONVROT || !ggml_vk_can_use_quantize_i8_convrot(ctx->device, quant)) {
+        return 0;
+    }
+    const ggml_tensor * nodes[4] {};
+    ggml_op ops[4] {};
+    const ggml_tensor * mod = nullptr;
+    const bool affine = quant->src[0]->op == GGML_OP_ADD;
+    const int count = affine ? 4 : 3;
+    if (affine) {
+        const ggml_tensor * shift = quant->src[0];
+        const ggml_tensor * add = shift->src[0];
+        if (add->op != GGML_OP_ADD || add->src[1]->op != GGML_OP_MUL || add->src[1]->src[0] != add->src[0]) {
+            return 0;
+        }
+        nodes[0] = add->src[1]; nodes[1] = add; nodes[2] = shift; nodes[3] = quant;
+        mod = nodes[0]->src[1];
+        const ggml_tensor * vector = shift->src[1];
+        if (vector->type != GGML_TYPE_F32 || !ggml_is_contiguous(vector) ||
+            vector->ne[0] != add->ne[0] || ggml_nelements(vector) != add->ne[0]) {
+            return 0;
+        }
+    } else {
+        const ggml_tensor * mul = quant->src[0];
+        if (mul->op != GGML_OP_MUL || mul->src[0]->op != GGML_OP_NORM) {
+            return 0;
+        }
+        nodes[0] = mul->src[0]; nodes[1] = mul; nodes[2] = quant;
+        mod = mul->src[1];
+    }
+    const ggml_tensor * x = nodes[0]->src[0];
+    if ((x->ne[0] != 4096 && x->ne[0] != 6144) ||
+        !ctx->device->pipeline_modulate_convrot[affine][x->ne[0] == 4096 ? 0 : 1] ||
+        x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || mod->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(mod) || mod->ne[0] != x->ne[0] || ggml_nelements(mod) != x->ne[0]) {
+        return 0;
+    }
+    for (int j = 0; j < count; ++j) {
+        ops[j] = nodes[j]->op;
+        if (j < count - 1 && (nodes[j]->type != GGML_TYPE_F32 || !ggml_is_contiguous(nodes[j]) || !ggml_are_same_shape(x, nodes[j]))) {
+            return 0;
+        }
+    }
+    int next = count - 1;
+    for (int j = quant_idx; j >= std::max(0, quant_idx - 64) && next >= 0; --j) {
+        if (graph->nodes[j] == nodes[next]) {
+            indices[next--] = j;
+        }
+    }
+    return next < 0 && ggml_can_fuse_subgraph_ext(graph, indices, count, ops, &quant_idx, 1) ? count : 0;
+}
+
+static int ggml_vk_can_fuse_modulate_convrot(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    const ggml_op op = graph->nodes[i]->op;
+    if (op != GGML_OP_NORM && op != GGML_OP_MUL) {
+        return 0;
+    }
+    const int count = op == GGML_OP_NORM ? 3 : 4;
+    int indices[4];
+    if (ggml_vk_match_modulate_convrot(ctx, graph, i + count - 1, indices) != count) {
+        return 0;
+    }
+    for (int j = 0; j < count; ++j) {
+        if (indices[j] != i + j) {
+            return 0;
+        }
+    }
+    return count;
 }
 
 static bool ggml_vk_match_i8_swiglu_split(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i, int * indices) {
@@ -14874,6 +15067,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_i8_swiglu = false;
         ctx->fused_i8_swiglu_split = false;
         ctx->fused_i8_residual = false;
+        ctx->fused_modulate_convrot = false;
+        ctx->fused_swiglu_convrot = false;
+        ctx->fused_sigmoid_convrot = false;
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
@@ -14886,6 +15082,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_sigmoid_convrot(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_sigmoid_convrot = true;
+                fusion_string = "SIGMOID_MUL_CONVROT";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse_swiglu_convrot(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_swiglu_convrot = true;
+                fusion_string = "SWIGLU_CONVROT";
+                std::fill_n(op_srcs_fused_elementwise, 2, false);
+            } else if (int count = ggml_vk_can_fuse_modulate_convrot(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = count - 1;
+                ctx->fused_modulate_convrot = true;
+                fusion_string = "MODULATE_CONVROT";
+                std::fill_n(op_srcs_fused_elementwise, count, false);
             } else if (int count = ggml_vk_can_fuse_i8_residual(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = count - 1;
                 ctx->fused_i8_residual = true;
@@ -15134,6 +15345,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_i8_swiglu = false;
                 ctx->fused_i8_swiglu_split = false;
                 ctx->fused_i8_residual = false;
+                ctx->fused_modulate_convrot = false;
+                ctx->fused_swiglu_convrot = false;
+                ctx->fused_sigmoid_convrot = false;
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;

@@ -882,6 +882,15 @@ struct vk_quantize_i8_convrot_push_constants {
     uint32_t rows;
 };
 
+struct vk_modulate_convrot_push_constants {
+    uint32_t rows;
+    uint32_t x_offset;
+    uint32_t m_offset;
+    uint32_t h_offset;
+    float eps;
+    uint32_t k;
+};
+
 struct vk_mul_mat_i8_tensorwise_push_constants {
     uint32_t n;
     uint32_t rows;

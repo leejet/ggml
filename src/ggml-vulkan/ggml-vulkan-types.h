@@ -790,6 +790,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_i8_convrot;
+    vk_pipeline pipeline_quantize_i8_convrot_subgroup;
+    vk_pipeline pipeline_quantize_i8_convrot_register[4];
+    vk_pipeline pipeline_swiglu_quantize_i8_convrot;
+    vk_pipeline pipeline_swiglu_quantize_i8_convrot_16384;
+    vk_pipeline pipeline_sigmoid_quantize_i8_convrot_6144;
+    vk_pipeline pipeline_modulate_convrot[2][2];
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2;
@@ -1291,6 +1297,9 @@ struct ggml_backend_vk_context {
     bool fused_i8_swiglu = false;
     bool fused_i8_swiglu_split = false;
     bool fused_i8_residual = false;
+    bool fused_modulate_convrot = false;
+    bool fused_swiglu_convrot = false;
+    bool fused_sigmoid_convrot = false;
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
