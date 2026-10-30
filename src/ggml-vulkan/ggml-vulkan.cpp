@@ -3309,6 +3309,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
+    if (device->coopmat2 && device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_fa_pad_kv, "fa_pad_kv", fa_pad_kv_len, fa_pad_kv_data, "main", 2, 20, {256, 1, 1}, {}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
@@ -8577,6 +8580,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
 
+    const bool pad_kv = tuning_params.path == FA_COOPMAT2 && HSK == 128 && HSV == 128 && N >= 512 &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && !use_dequant_kv && !use_sparse && mask == nullptr && !aligned && ctx->device->pipeline_fa_pad_kv &&
+        CEIL_DIV(KV, tuning_params.block_cols) * tuning_params.block_cols <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] * 8u;
+    if (pad_kv) {
+        // Keep logical KV bounds for softmax while loading zero-padded K/V tiles without clamping.
+        fa_pipeline_state.flags |= 32;
+    }
+
     vk_pipeline pipeline = nullptr;
 
     bool xe_fa_opt = false;
@@ -8818,6 +8829,34 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
         k_buf = k_dst;
         v_buf = v_dst;
+    }
+
+    if (pad_kv) {
+        const uint32_t padded = CEIL_DIV(KV, Bc) * Bc;
+        const uint64_t k_size = uint64_t(padded) * 128 * nek2 * nek3 * sizeof(ggml_fp16_t);
+        const uint64_t v_size = uint64_t(padded) * 128 * nev2 * nev3 * sizeof(ggml_fp16_t);
+        if (ctx->prealloc_size_x < k_size + v_size) {
+            ctx->prealloc_size_x = k_size + v_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer k_dst = {ctx->prealloc_x, 0, k_size};
+        vk_subbuffer v_dst = {ctx->prealloc_x, k_size, v_size};
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_fa_pad_kv, 2);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_pad_kv, {k_buf, k_dst},
+            std::vector<uint32_t>{KV, padded, k_stride, uint32_t(nbk2/2), uint32_t(nbk3/2)}, {padded*32, uint32_t(nek2), uint32_t(nek3)});
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_pad_kv, {v_buf, v_dst},
+            std::vector<uint32_t>{KV, padded, v_stride, uint32_t(nbv2/2), uint32_t(nbv3/2)}, {padded*32, uint32_t(nev2), uint32_t(nev3)});
+        ggml_vk_sync_buffers(ctx, subctx);
+        k_buf = k_dst;
+        v_buf = v_dst;
+        k_stride = v_stride = 128;
+        nbk2_eff = nbv2_eff = padded * 256;
+        nbk3_eff = nbk2_eff * (uint32_t)nek2;
+        nbv3_eff = nbv2_eff * (uint32_t)nev2;
+        ctx->prealloc_x_need_sync = true;
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;

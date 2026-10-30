@@ -1,0 +1,17 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+layout(binding = 0, std430) readonly buffer A { float16_t a[]; };
+layout(binding = 1, std430) writeonly buffer D { f16vec4 d[]; };
+layout(push_constant) uniform PC { uint rows; uint padded; uint stride; uint head_stride; uint batch_stride; } p;
+void main() {
+    uint item = gl_GlobalInvocationID.x;
+    if (item >= p.padded * 32) return;
+    uint row = item / 32;
+    uint col = (item % 32) * 4;
+    uint src = gl_WorkGroupID.z * p.batch_stride + gl_WorkGroupID.y * p.head_stride + row * p.stride + col;
+    f16vec4 value = f16vec4(0);
+    if (row < p.rows) value = f16vec4(a[src], a[src + 1], a[src + 2], a[src + 3]);
+    d[(gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * p.padded * 32 + item] = value;
+}

@@ -955,6 +955,7 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
     string_to_spv("concat_cast_f16", "concat_cast_f16.comp", {});
+    string_to_spv("fa_pad_kv", "fa_pad_kv.comp", {});
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("quantize_i8_convrot", "quantize_i8_convrot.comp", {});

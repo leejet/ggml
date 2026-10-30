@@ -306,6 +306,13 @@ void main() {
     tensorLayoutK = setTensorLayoutStrideNV(tensorLayoutK, k_stride, 1);
     tensorLayoutV = setTensorLayoutStrideNV(tensorLayoutV, v_stride, 1);
 
+    tensorLayoutNV<2> fullK = createTensorLayoutNV(2);
+    tensorLayoutNV<2> fullV = createTensorLayoutNV(2);
+    fullK = setTensorLayoutDimensionNV(fullK, KV_iter, HSK);
+    fullV = setTensorLayoutDimensionNV(fullV, KV_iter, HSV);
+    fullK = setTensorLayoutStrideNV(fullK, k_stride & ~7u, 1);
+    fullV = setTensorLayoutStrideNV(fullV, v_stride & ~7u, 1);
+
     coopmat<Q_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseAccumulator> Q;
     coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA> Qf16;
 
@@ -417,6 +424,8 @@ void main() {
         } else if (USE_DECODE_K) {
             coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose FADECODEK);
 #endif
+        } else if ((Flags & 32) != 0) {
+            coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(fullK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose);
         } else {
             coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose);
         }
@@ -488,6 +497,8 @@ void main() {
         } else if (USE_DECODE_V) {
             coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) FADECODEV);
 #endif
+        } else if ((Flags & 32) != 0) {
+            coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(fullV, j * Bc, Bc, 0, HSV_pad));
         } else {
             coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad));
         }

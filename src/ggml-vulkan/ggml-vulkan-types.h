@@ -795,6 +795,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_quantize_i8_convrot;
     vk_pipeline pipeline_swiglu_quantize_i8_convrot_16384;
     vk_pipeline pipeline_sigmoid_quantize_i8_convrot_6144;
+    vk_pipeline pipeline_fa_pad_kv;
     vk_pipeline pipeline_modulate_convrot[2][2];
     vk_pipeline pipeline_concat_cast_f16;
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
