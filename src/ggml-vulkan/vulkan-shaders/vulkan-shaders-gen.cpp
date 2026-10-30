@@ -672,6 +672,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         };
 
         string_to_spv(shader_name + "_quant_f16" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        if (coopmat2 && f16acc && shader_name == "matmul") {
+            string_to_spv("matmul_quant_gated_residual_f16", source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), { { "MULMAT_QUANT", "1" }, { "MUL_MAT_GATED_RESIDUAL", "1" }, { "B_TYPE", aligned_b_type_f16 }, { "D_TYPE", "float" } }), fp16, coopmat, coopmat2, f16acc);
+        }
 
         if (!coopmat2) {
             string_to_spv(shader_name + "_quant_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);

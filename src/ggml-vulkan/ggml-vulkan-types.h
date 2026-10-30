@@ -259,10 +259,10 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool gated_residual = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, gated_residual) < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.gated_residual);
     }
 };
 
@@ -529,6 +529,10 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> situ_matmul_gated_residual_pattern{ GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD };
+
+static constexpr std::initializer_list<ggml_op> matmul_gated_residual_pattern{ GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD };
+
 static constexpr std::initializer_list<ggml_op> situ_matmul_pattern{ GGML_OP_GLU, GGML_OP_MUL_MAT };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
@@ -1291,6 +1295,8 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     ggml_tensor * fused_situ_matmul{};
+    bool fused_matmul_gated_residual{};
+    ggml_tensor * fused_situ_gated_output{};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
