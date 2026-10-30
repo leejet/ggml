@@ -672,6 +672,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         };
 
         string_to_spv(shader_name + "_quant_f16" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        if (coopmat2 && f16acc && shader_name == "matmul") {
+            string_to_spv("matmul_quant_gated_residual_f16", source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), { { "MULMAT_QUANT", "1" }, { "MUL_MAT_GATED_RESIDUAL", "1" }, { "B_TYPE", aligned_b_type_f16 }, { "D_TYPE", "float" } }), fp16, coopmat, coopmat2, f16acc);
+        }
 
         if (!coopmat2) {
             string_to_spv(shader_name + "_quant_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
@@ -1072,6 +1075,8 @@ void process_shaders() {
     string_to_spv("reglu_f32",      "reglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_f32",     "swiglu.comp",      {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("situ_f32", "situ.comp", { { "A_TYPE", "float" }, { "D_TYPE", "float" } });
+    string_to_spv("situ_f16", "situ.comp", { { "A_TYPE", "float" }, { "D_TYPE", "float16_t" }, { "SITU_PACK_F16", "1" } });
     string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_clamp_f16", "swiglu_clamp.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
