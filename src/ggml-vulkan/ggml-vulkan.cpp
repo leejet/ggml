@@ -15714,6 +15714,55 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
+    std::vector<std::vector<int>> fusion_patterns(graph->n_nodes);
+    for (int q = 0; q < graph->n_nodes; ++q) {
+        int indices[6];
+        int count = ggml_vk_match_modulate_convrot(ctx, graph, q, indices);
+        if (!count) {
+            count = ggml_vk_match_i8_residual(ctx, graph, q, indices);
+        }
+        if (!count && ggml_vk_match_i8_swiglu_split(ctx, graph, q, indices)) {
+            count = 3;
+        }
+        if (!count && ggml_vk_match_rms_rope_apply(ctx, graph, q, indices)) {
+            count = 3;
+        }
+        if (!count) {
+            count = ggml_vk_match_concat_cast_f16(ctx, graph, q, indices);
+        }
+        if (!count && graph->nodes[q]->op == GGML_OP_MUL && graph->nodes[q]->src[0]->op == GGML_OP_RMS_NORM &&
+            graph->nodes[q]->ne[0] >= 1024 && graph->nodes[q]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous_rows(graph->nodes[q]->src[0]) && ggml_is_contiguous_rows(graph->nodes[q]->src[1])) {
+            for (int j = q - 1; j >= std::max(0, q - 32); --j) {
+                if (graph->nodes[j] == graph->nodes[q]->src[0]) {
+                    indices[0] = j;
+                    indices[1] = q;
+                    const ggml_op ops[] = {GGML_OP_RMS_NORM, GGML_OP_MUL};
+                    if (ggml_can_fuse_subgraph_ext(graph, indices, 2, ops, &q, 1)) {
+                        count = 2;
+                    }
+                    break;
+                }
+            }
+        }
+        if (count) {
+            fusion_patterns[indices[0]].assign(indices, indices + count);
+        }
+    }
+
+    for (const auto & pattern : fusion_patterns) {
+        std::set<ggml_tensor *> seen;
+        for (int index : pattern) {
+            ggml_tensor * node = graph->nodes[index];
+            for (auto src : node->src) {
+                if (src != nullptr && seen.insert(src).second) {
+                    params->add_alloc_dep(params->user_data, src, graph->nodes[pattern.back()]);
+                }
+            }
+            seen.insert(node);
+        }
+    }
+
     int first_unused = 0;
 
     // scheduled or zero-compute nodes in [lo, hi)
@@ -15788,6 +15837,82 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return keep_pattern(pattern);
         };
 
+        const auto & fusion_pattern = fusion_patterns[first_unused];
+        if (!fusion_pattern.empty()) {
+            bool intact = true;
+            for (int index : fusion_pattern) {
+                intact &= !used[index];
+            }
+            bool ready = intact;
+            for (int index : fusion_pattern) {
+                for (int j = first_unused; j < index; ++j) {
+                    if (!used[j] && std::find(fusion_pattern.begin(), fusion_pattern.end(), j) == fusion_pattern.end() &&
+                        is_src_of(graph->nodes[index], graph->nodes[j])) {
+                        ready = false;
+                    }
+                }
+            }
+            if (!ready && intact) {
+                std::vector<int> prerequisites;
+                bool movable = true;
+                for (int j = fusion_pattern.back() - 1; j > first_unused; --j) {
+                    if (used[j] || std::find(fusion_pattern.begin(), fusion_pattern.end(), j) != fusion_pattern.end()) {
+                        continue;
+                    }
+                    bool needed = false;
+                    for (int index : fusion_pattern) {
+                        needed |= is_src_of(graph->nodes[index], graph->nodes[j]);
+                    }
+                    for (int index : prerequisites) {
+                        needed |= is_src_of(graph->nodes[index], graph->nodes[j]);
+                    }
+                    if (needed) {
+                        for (int index : fusion_pattern) {
+                            if (index < j) {
+                                movable &= !is_src_of(graph->nodes[j], graph->nodes[index]);
+                            }
+                        }
+                        prerequisites.push_back(j);
+                    }
+                }
+                if (movable) {
+                    for (auto it = prerequisites.rbegin(); it != prerequisites.rend(); ++it) {
+                        new_order.push_back(graph->nodes[*it]);
+                        used_node_set.insert(graph->nodes[*it]);
+                        used[*it] = true;
+                    }
+                    ready = true;
+                }
+            }
+            if (ready) {
+                for (int index : fusion_pattern) {
+                    ggml_tensor * node = graph->nodes[index];
+                    new_order.push_back(node);
+                    used_node_set.insert(node);
+                    used[index] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    ++first_unused;
+                }
+                continue;
+            }
+        }
+        if (ggml_vk_can_fuse_sigmoid_convrot(ctx, graph, first_unused)) {
+            add_pattern_alloc_deps({GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_QUANTIZE_I8_CONVROT}, first_unused + 2);
+            keep_pattern({GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_QUANTIZE_I8_CONVROT});
+            continue;
+        }
+        if (match_pattern({GGML_OP_GLU, GGML_OP_QUANTIZE_I8_CONVROT}, first_unused) && ggml_vk_can_fuse_swiglu_convrot(ctx, graph, first_unused)) {
+            add_pattern_alloc_deps({GGML_OP_GLU, GGML_OP_QUANTIZE_I8_CONVROT}, first_unused + 1);
+            keep_pattern({GGML_OP_GLU, GGML_OP_QUANTIZE_I8_CONVROT});
+            continue;
+        }
+        if (match_pattern({GGML_OP_MUL_MAT, GGML_OP_GLU}, first_unused) &&
+            ggml_vk_can_fuse_i8_swiglu(ctx, graph, first_unused)) {
+            add_pattern_alloc_deps({GGML_OP_MUL_MAT, GGML_OP_GLU}, first_unused + 1);
+            keep_pattern({GGML_OP_MUL_MAT, GGML_OP_GLU});
+            continue;
+        }
         if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
             continue;
         }
@@ -15830,6 +15955,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             keep_pattern(hc_post_gate_pattern);
             continue;
         }
+        if (match_pattern({GGML_OP_RMS_NORM, GGML_OP_MUL}, first_unused) &&
+            ggml_vk_can_fuse(ctx, graph, first_unused, {GGML_OP_RMS_NORM, GGML_OP_MUL})) {
+            add_pattern_alloc_deps({GGML_OP_RMS_NORM, GGML_OP_MUL}, first_unused + 1);
+            keep_pattern({GGML_OP_RMS_NORM, GGML_OP_MUL});
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -15858,7 +15989,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
+            if (!fusion_patterns[j].empty() || ggml_vk_can_fuse_sigmoid_convrot(ctx, graph, j) || ggml_vk_can_fuse_swiglu_convrot(ctx, graph, j) || ggml_vk_can_fuse_i8_residual(ctx, graph, j) ||
+                ggml_vk_can_fuse_i8_swiglu(ctx, graph, j) ||
+                match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
