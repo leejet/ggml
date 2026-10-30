@@ -529,6 +529,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_apply_pattern{ GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY };
+static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_apply_cast_pattern{ GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE_APPLY, GGML_OP_CPY };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -620,6 +622,7 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
     RMS_NORM_MUL_ROPE,
+    RMS_NORM_MUL_ROPE_APPLY,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
     RMS_NORM_COUNT,
@@ -924,6 +927,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
 
     vk_pipeline pipeline_rope_apply_f32;
+    vk_pipeline pipeline_rms_norm_mul_rope_apply_f32;
+    vk_pipeline pipeline_rms_norm_mul_rope_apply_f16;
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
