@@ -1,0 +1,41 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint row = gl_WorkGroupID.x * 4 + gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    if (row >= p.ne01) {
+        return;
+    }
+    for (uint batch = gl_WorkGroupID.z; batch < p.ne03; batch += gl_NumWorkGroups.z) {
+        for (uint channel = gl_WorkGroupID.y; channel < p.ne02; channel += gl_NumWorkGroups.y) {
+            const uint input_offset = get_aoffset() + row * p.nb01 + channel * p.nb02 + batch * p.nb03;
+            float values[4];
+            precise float squares[4];
+            for (uint i = 0; i < 4; ++i) {
+                values[i] = data_a[input_offset + lane + 32 * i];
+                squares[i] = values[i] * values[i];
+            }
+            // Match the original 512-thread tree with its 128 nonzero leaves.
+            precise float sum = (squares[0] + squares[2]) + (squares[1] + squares[3]);
+            for (uint step = 16; step > 0; step >>= 1) {
+                sum = sum + subgroupShuffleXor(sum, step);
+            }
+            sum = subgroupShuffle(sum, 0);
+            const float scale = inversesqrt(sum / 128.0f + p.param1);
+            const uint output_offset = get_doffset() + ((batch * p.ne02 + channel) * p.ne01 + row) * 128;
+            for (uint i = 0; i < 4; ++i) {
+                const uint col = lane + 32 * i;
+                precise float normalized = scale * values[i];
+                precise float weighted = normalized * data_b[get_boffset() + col];
+                data_d[output_offset + col] = weighted;
+            }
+        }
+    }
+}
