@@ -3268,6 +3268,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    if (device->vendor_id == VK_VENDOR_ID_NVIDIA) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_modulate_f32, "rms_norm_modulate_f32", rms_norm_modulate_f32_len, rms_norm_modulate_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), { 1, 1, 1 }, { 0, 1 }, 1, true);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -11020,6 +11023,27 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
+    if (ctx->fused_rms_norm_mode == RMS_NORM_MODULATE) {
+        const ggml_tensor * weighted   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * product    = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * add        = cgraph->nodes[node_idx + 3];
+        ggml_tensor * dst              = cgraph->nodes[node_idx + 4];
+        const ggml_tensor * weight     = weighted->src[0] == rms ? weighted->src[1] : weighted->src[0];
+        const ggml_tensor * scale      = product->src[0] == weighted ? product->src[1] : product->src[0];
+        const ggml_tensor * shift      = dst->src[0] == add ? dst->src[1] : dst->src[0];
+        vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, weight, dst, op_params[0], 0);
+        init_pushconst_tensor_offsets(ctx, pc, src0, weight, scale, shift, dst);
+        vk_pipeline pipeline = ctx->device->pipeline_rms_norm_modulate_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                  { ggml_vk_tensor_subbuffer(ctx, src0, true), ggml_vk_tensor_subbuffer(ctx, weight, true),
+                                    ggml_vk_tensor_subbuffer(ctx, dst, true), ggml_vk_tensor_subbuffer(ctx, scale),
+                                    ggml_vk_tensor_subbuffer(ctx, shift) },
+                                  pc, { (uint32_t)src0->ne[1], 1, 1 });
+        ggml_vk_rms_norm_finish(ctx, src0);
+        return;
+    }
+
     if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 2);
         ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
@@ -14401,6 +14425,43 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
     return false;
 }
 
+static bool ggml_vk_can_fuse_rms_norm_modulate(ggml_backend_vk_context * ctx, const ggml_cgraph * graph,
+                                               int node_idx, bool check_overlap = true) {
+    if (!ctx->device->pipeline_rms_norm_modulate_f32 || ctx->do_add_rms_partials ||
+        !ggml_can_fuse_subgraph(graph, node_idx, rms_norm_modulate_pattern, { node_idx + 4 })) {
+        return false;
+    }
+    const ggml_tensor * rms      = graph->nodes[node_idx];
+    const ggml_tensor * weighted = graph->nodes[node_idx + 1];
+    const ggml_tensor * product  = graph->nodes[node_idx + 2];
+    const ggml_tensor * add      = graph->nodes[node_idx + 3];
+    const ggml_tensor * dst      = graph->nodes[node_idx + 4];
+    const ggml_tensor * x        = rms->src[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != 3072 || x->ne[1] <= 1 ||
+        x->ne[1] > ctx->device->properties.limits.maxComputeWorkGroupCount[0] || x->ne[2] != 1 || x->ne[3] != 1 ||
+        !ggml_is_contiguous(x) || !ggml_vk_can_fuse(ctx, graph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL }) ||
+        (product->src[0] != weighted && product->src[1] != weighted) ||
+        !((add->src[0] == weighted && add->src[1] == product) || (add->src[1] == weighted && add->src[0] == product)) ||
+        (dst->src[0] != add && dst->src[1] != add)) {
+        return false;
+    }
+    const ggml_tensor * weight = weighted->src[0] == rms ? weighted->src[1] : weighted->src[0];
+    const ggml_tensor * scale  = product->src[0] == weighted ? product->src[1] : product->src[0];
+    const ggml_tensor * shift  = dst->src[0] == add ? dst->src[1] : dst->src[0];
+    for (const ggml_tensor * tensor : { weight, scale, shift }) {
+        if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != 3072 || ggml_nelements(tensor) != 3072 || !ggml_is_contiguous(tensor) ||
+            (check_overlap && (get_misalign_bytes(ctx, tensor) != 0 || ggml_vk_tensors_overlap(tensor, dst, false)))) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * tensor : { rms, weighted, product, add, dst }) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_are_same_shape(tensor, x) || !ggml_is_contiguous(tensor)) {
+            return false;
+        }
+    }
+    return !check_overlap || !ggml_vk_tensors_overlap(x, dst, false);
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -14694,6 +14755,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_rms_norm_modulate(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 4;
+                ctx->fused_rms_norm_mode      = RMS_NORM_MODULATE;
+                fusion_string                 = "RMS_NORM_MODULATE";
+                std::fill_n(op_srcs_fused_elementwise, 5, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_mul_rope_view_set_rows_pattern, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
@@ -15142,6 +15208,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        if (ggml_vk_can_fuse_rms_norm_modulate(ctx, graph, first_unused, false) &&
+            match_pattern(rms_norm_modulate_pattern, first_unused)) {
+            add_pattern_alloc_deps(rms_norm_modulate_pattern, first_unused + 4);
+            keep_pattern(rms_norm_modulate_pattern);
+            continue;
+        }
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
@@ -15199,6 +15271,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
+                match_pattern(rms_norm_modulate_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||

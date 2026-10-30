@@ -27,7 +27,7 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 #define GGML_ROPE_TYPE_MROPE  8
 #define GGML_ROPE_TYPE_VISION 24
 
-#elif RMS_NORM_ADD_FUSION
+#elif RMS_NORM_ADD_FUSION || RMS_NORM_MODULATE_FUSION
 
 layout (binding = 3) readonly buffer C {float data_c[];};
 layout (binding = 4) readonly buffer E {float data_e[];};
@@ -49,6 +49,21 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+#if RMS_NORM_MODULATE_FUSION
+shared float modulation_input[BLOCK_SIZE];
+
+float modulate(float value, uint col) {
+    // Keep precise modulation from changing the original normalization FMAs.
+    modulation_input[gl_LocalInvocationIndex] = value;
+    memoryBarrierShared();
+    float weighted = modulation_input[gl_LocalInvocationIndex];
+    precise float product = weighted * data_c[col];
+    precise float residual = weighted + product;
+    precise float shifted = residual + data_e[col];
+    return shifted;
+}
+#endif
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -110,6 +125,9 @@ void rms_norm(uint num_iters) {
                             continue;
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]);
+#if RMS_NORM_MODULATE_FUSION
+                        value = modulate(value, col);
+#endif
 #if RMS_NORM_ADD_FUSION
                         value += FLOAT_TYPE(data_c[d_offset + col]);
                         if (do_post_multiply) {
@@ -124,6 +142,9 @@ void rms_norm(uint num_iters) {
                             continue;
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]);
+#if RMS_NORM_MODULATE_FUSION
+                        value = modulate(value, col);
+#endif
 #if RMS_NORM_ADD_FUSION
                         value += FLOAT_TYPE(data_c[d_offset + col]);
                         if (do_post_multiply) {
@@ -157,6 +178,10 @@ void rms_norm(uint num_iters) {
 }
 
 void main() {
+#if RMS_NORM_MODULATE_FUSION
+    // Match the generic kernel's 3072-column branch.
+    rms_norm(8);
+#else
     // instantiate the rms_norm function for several different
     // dimensions, to allow loop unrolling
     uint num_blocks = (p.ne00 + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -181,4 +206,5 @@ void main() {
     } else if (num_blocks == 1) {
         rms_norm(1);
     }
+#endif
 }
