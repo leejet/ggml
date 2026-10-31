@@ -7921,6 +7921,17 @@ static bool ggml_backend_cuda_ext_context(ggml_backend_t backend, ggml_ext_cuda_
     return true;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void * ggml_backend_cuda_ext_blas(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    return (void *) ctx->cublas_handle();
+}
+#endif
+
 static int ggml_backend_cuda_ext_device(ggml_backend_dev_t device) {
     if (!device || device->iface.get_name != ggml_backend_cuda_device_get_name) {
         return -1;
@@ -7934,6 +7945,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_ext_cuda_context_v1") == 0) {
         return (void *) ggml_backend_cuda_ext_context;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_ext_cuda_blas_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_blas;
+    }
+#endif
     if (strcmp(name, "ggml_ext_cuda_device_v1") == 0) {
         return (void *) ggml_backend_cuda_ext_device;
     }

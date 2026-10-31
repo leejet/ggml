@@ -88,6 +88,12 @@ typedef bool (*ggml_ext_cuda_context_fn)(ggml_backend_t backend, struct ggml_ext
 // Returns the physical runtime ordinal, or -1 for a non-CUDA device.
 typedef int (*ggml_ext_cuda_device_fn)(ggml_backend_dev_t device);
 
+// Query "ggml_ext_cuda_blas_v1" during execute to borrow the current stream's
+// cuBLAS handle, with host scalar pointers. Do not retain/destroy it or change
+// its stream, pointer mode, math mode, or workspace. CUDA only.
+typedef void * (*ggml_ext_cuda_blas_fn)(ggml_backend_t backend);
+
+
 // Query "ggml_ext_cpu_parallel_v1" to use the backend's configured thread pool.
 // The callback receives a temporary output descriptor; userdata can reference the
 // original nodes. Execution is synchronous and honors the CPU abort callback.
