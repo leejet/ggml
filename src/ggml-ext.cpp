@@ -360,7 +360,7 @@ static bool ggml_ext_is_pure(const ggml_tensor * node, bool allow_inplace = fals
     switch (node->op) {
         case GGML_OP_ADD: case GGML_OP_MUL: case GGML_OP_SCALE:
         case GGML_OP_NORM: case GGML_OP_RMS_NORM: case GGML_OP_MUL_MAT:
-        case GGML_OP_UNARY: case GGML_OP_GLU: case GGML_OP_ROPE_APPLY:
+        case GGML_OP_UNARY: case GGML_OP_GLU:
         case GGML_OP_FLASH_ATTN_EXT: case GGML_OP_QUANTIZE_I8_CONVROT:
         case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
         case GGML_OP_CONT: case GGML_OP_CONCAT: case GGML_OP_REPEAT:
