@@ -184,8 +184,8 @@ static bool ggml_ext_is_view(const ggml_tensor * node) {
            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
 }
 
-static bool ggml_ext_is_pure(const ggml_tensor * node) {
-    if (node->view_src && !ggml_ext_is_view(node)) {
+static bool ggml_ext_is_pure(const ggml_tensor * node, bool allow_inplace = false) {
+    if (node->view_src && !ggml_ext_is_view(node) && !allow_inplace) {
         return false;
     }
     switch (node->op) {
@@ -194,13 +194,31 @@ static bool ggml_ext_is_pure(const ggml_tensor * node) {
         case GGML_OP_UNARY: case GGML_OP_GLU: case GGML_OP_ROPE_APPLY:
         case GGML_OP_FLASH_ATTN_EXT: case GGML_OP_QUANTIZE_I8_CONVROT:
         case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
-        case GGML_OP_CONT: case GGML_OP_CONCAT:
+        case GGML_OP_CONT: case GGML_OP_CONCAT: case GGML_OP_REPEAT:
             return true;
         case GGML_OP_CUSTOM:
             return ggml_ext_op_get(node) != nullptr;
+        case GGML_OP_CPY:
+            return !node->view_src && node->src[1] == node;
         default:
             return false;
     }
+}
+
+static const ggml_tensor * ggml_ext_storage(const ggml_tensor * node) {
+    while (node && node->view_src) {
+        node = node->view_src;
+    }
+    return node;
+}
+
+static bool ggml_ext_is_internal_write(const ggml_cgraph * graph, int first, int index) {
+    const auto * node = graph->nodes[index];
+    if (!node->view_src || ggml_ext_is_view(node) || !ggml_ext_is_pure(node, true)) {
+        return false;
+    }
+    const auto * owner = ggml_ext_storage(node);
+    return std::find(graph->nodes + first, graph->nodes + index, owner) != graph->nodes + index;
 }
 
 bool ggml_ext_graph_delay(ggml_cgraph * graph, int first, int count, int before) {
@@ -208,26 +226,22 @@ bool ggml_ext_graph_delay(ggml_cgraph * graph, int first, int count, int before)
         before < first + count || before > graph->n_nodes) {
         return false;
     }
-    auto storage = [](const ggml_tensor * node) {
-        while (node && node->view_src) {
-            node = node->view_src;
-        }
-        return node;
-    };
     for (int i = first; i < before; ++i) {
         const auto * node = graph->nodes[i];
-        const bool copy = node->op == GGML_OP_CPY && node->view_src && i >= first + count;
-        if (!ggml_ext_is_pure(node) && !copy) {
+        const bool write = i >= first + count && node->view_src && !ggml_ext_is_view(node) &&
+            (node->op == GGML_OP_CPY || ggml_ext_is_pure(node, true));
+        const bool internal_write = i < first + count && ggml_ext_is_internal_write(graph, first, i);
+        if (!ggml_ext_is_pure(node) && !internal_write && !write) {
             return false;
         }
-        if (copy) {
-            const auto * destination = storage(node);
+        if (write) {
+            const auto * destination = ggml_ext_storage(node);
             for (int j = first; j < first + count; ++j) {
-                if (destination == storage(graph->nodes[j])) {
+                if (destination == ggml_ext_storage(graph->nodes[j])) {
                     return false;
                 }
                 for (const auto * src : graph->nodes[j]->src) {
-                    if (src && destination == storage(src)) {
+                    if (src && destination == ggml_ext_storage(src)) {
                         return false;
                     }
                 }
@@ -258,7 +272,8 @@ static bool ggml_ext_can_fuse(const ggml_cgraph * graph, int first, int count) {
         const auto * node = graph->nodes[i];
         const bool output = i == first + count - 1;
         const bool copy = output && node->op == GGML_OP_CPY;
-        if ((!copy && !ggml_ext_is_pure(node)) || (output && node->view_src && !copy)) {
+        if ((!copy && !ggml_ext_is_pure(node) && !ggml_ext_is_internal_write(graph, first, i)) ||
+            (output && node->view_src && !copy)) {
             return false;
         }
         indices.push_back(i);

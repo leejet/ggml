@@ -41,7 +41,8 @@ struct ggml_ext_execution_context {
 
 // Single-node supports/preferred and fusion match inspect metadata only. They must
 // not call ggml_backend_dev_supports_op recursively. A match consumes consecutive,
-// pure, out-of-place nodes and writes only the final node, which may be a CPY.
+// pure operators and writes only the final node, which may be a CPY. In-place
+// intermediates are allowed only when their storage is created within the match.
 // A terminal CPY retains its write semantics; execute must handle input/output
 // storage overlap (including allocator reuse), using workspace when needed.
 // Returning zero declines.
