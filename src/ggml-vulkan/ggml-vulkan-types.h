@@ -791,7 +791,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_i8_convrot;
     vk_pipeline pipeline_quantize_i8_convrot_subgroup;
-    vk_pipeline pipeline_quantize_i8_convrot_register[4];
+    std::map<uint32_t, vk_pipeline> pipeline_quantize_i8_convrot_register;
     vk_pipeline pipeline_swiglu_quantize_i8_convrot;
     vk_pipeline pipeline_swiglu_quantize_i8_convrot_16384;
     vk_pipeline pipeline_sigmoid_quantize_i8_convrot_6144;

@@ -960,9 +960,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("quantize_i8_convrot", "quantize_i8_convrot.comp", {});
     string_to_spv("quantize_i8_convrot_subgroup", "quantize_i8_convrot_subgroup.comp", {});
-    for (const std::string & cols : {"4096", "6144", "12288", "16384"}) {
-        string_to_spv("quantize_i8_convrot_register_" + cols, "quantize_i8_convrot_subgroup.comp", {{"SINGLE_PASS", "1"}, {"STATIC_K", cols}});
-    }
+    string_to_spv("quantize_i8_convrot_register", "quantize_i8_convrot_subgroup.comp", {{"SINGLE_PASS", "1"}});
     string_to_spv("swiglu_quantize_i8_convrot", "quantize_i8_convrot_subgroup.comp", {{"SWIGLU", "1"}});
     string_to_spv("swiglu_quantize_i8_convrot_16384", "quantize_i8_convrot_subgroup.comp", {{"SWIGLU", "1"}, {"SINGLE_PASS", "1"}, {"STATIC_K", "16384"}});
     string_to_spv("sigmoid_quantize_i8_convrot_6144", "quantize_i8_convrot_subgroup.comp", {{"SIGMOID_MUL", "1"}, {"SINGLE_PASS", "1"}, {"STATIC_K", "6144"}});

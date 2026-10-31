@@ -3257,10 +3257,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->subgroup_size == 32 && device->subgroup_require_full_support && device->subgroup_shuffle && device->subgroup_arithmetic && device->properties.limits.maxComputeWorkGroupInvocations >= 256) {
             ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot_subgroup, "quantize_i8_convrot_subgroup", quantize_i8_convrot_subgroup_len, quantize_i8_convrot_subgroup_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
             ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_i8_convrot, "swiglu_quantize_i8_convrot", swiglu_quantize_i8_convrot_len, swiglu_quantize_i8_convrot_data, "main", 4, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
-            const uint64_t lengths[] = {quantize_i8_convrot_register_4096_len, quantize_i8_convrot_register_6144_len, quantize_i8_convrot_register_12288_len, quantize_i8_convrot_register_16384_len};
-            const unsigned char * data[] = {quantize_i8_convrot_register_4096_data, quantize_i8_convrot_register_6144_data, quantize_i8_convrot_register_12288_data, quantize_i8_convrot_register_16384_data};
-            for (uint32_t index = 0; index < 4; ++index) {
-                ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_convrot_register[index], "quantize_i8_convrot_register", lengths[index], data[index], "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+            for (auto & entry : device->pipeline_quantize_i8_convrot_register) {
+                ggml_vk_create_pipeline(device, entry.second, "quantize_i8_convrot_register", quantize_i8_convrot_register_len, quantize_i8_convrot_register_data, "main", 3, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {entry.first}, 1, true, true, 32);
             }
             ggml_vk_create_pipeline(device, device->pipeline_swiglu_quantize_i8_convrot_16384, "swiglu_quantize_i8_convrot_16384", swiglu_quantize_i8_convrot_16384_len, swiglu_quantize_i8_convrot_16384_data, "main", 4, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
             ggml_vk_create_pipeline(device, device->pipeline_sigmoid_quantize_i8_convrot_6144, "sigmoid_quantize_i8_convrot_6144", sigmoid_quantize_i8_convrot_6144_len, sigmoid_quantize_i8_convrot_6144_data, "main", 4, sizeof(vk_quantize_i8_convrot_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
@@ -7487,11 +7485,18 @@ static void ggml_vk_quantize_i8_convrot(
     if (src->ne[0] >= 1024 && ctx->device->pipeline_quantize_i8_convrot_subgroup) {
         pipeline = ctx->device->pipeline_quantize_i8_convrot_subgroup;
     }
-    for (int index = 0; index < 4; ++index) {
-        const int64_t cols[] = {4096, 6144, 12288, 16384};
-        if (src->ne[0] == cols[index] && ctx->device->pipeline_quantize_i8_convrot_register[index]) {
-            pipeline = ctx->device->pipeline_quantize_i8_convrot_register[index];
+    // Each invocation retains eight values per group of 2048 columns. Bound private
+    // storage to avoid specializing arbitrarily wide rows with excessive register pressure.
+    static constexpr uint32_t max_register_values = 64;
+    const int64_t register_values = CEIL_DIV(src->ne[0], 2048) * 8;
+    if (up == nullptr && !sigmoid && src->ne[0] >= 1024 && register_values <= max_register_values &&
+        ctx->device->pipeline_quantize_i8_convrot_subgroup) {
+        std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+        auto & specialized = ctx->device->pipeline_quantize_i8_convrot_register[(uint32_t) src->ne[0]];
+        if (!specialized) {
+            specialized = std::make_shared<vk_pipeline_struct>();
         }
+        pipeline = specialized;
     }
     if (up != nullptr) {
         pipeline = src->ne[0] == 16384 ? ctx->device->pipeline_swiglu_quantize_i8_convrot_16384 : ctx->device->pipeline_swiglu_quantize_i8_convrot;

@@ -70,8 +70,9 @@ void main() {
     for (uint row = gl_WorkGroupID.x; row < p.rows; row += gl_NumWorkGroups.x) {
         float local_max = 0.0;
 #ifdef SINGLE_PASS
-        float values[K / 256];
-        [[unroll]] for (uint g = 0; g < K / 2048; ++g) {
+        float values[((K + 2047) / 2048) * 8];
+        [[unroll]] for (uint g = 0; g < (K + 2047) / 2048; ++g) {
+            if (gl_SubgroupID + g * 8 >= K / 256) continue;
             float v[8]; transform_group(row, gl_SubgroupID + g * 8, v);
             [[unroll]] for (uint j = 0; j < 8; ++j) {
                 values[g * 8 + j] = v[j];
@@ -97,7 +98,8 @@ void main() {
         const float row_scale = maxima[0] / 127.0;
         const float inv_scale = row_scale == 0.0 ? 0.0 : 1.0 / row_scale;
 #ifdef SINGLE_PASS
-        [[unroll]] for (uint g = 0; g < K / 2048; ++g) {
+        [[unroll]] for (uint g = 0; g < (K + 2047) / 2048; ++g) {
+            if (gl_SubgroupID + g * 8 >= K / 256) continue;
             [[unroll]] for (uint j = 0; j < 8; ++j) {
                 data_d[row * p.k + (gl_SubgroupID + g * 8) * 256 + gl_SubgroupInvocationID + j * 32] = int8_t(clamp(int(roundEven(values[g * 8 + j] * inv_scale)), -127, 127));
             }
