@@ -43,6 +43,8 @@ struct ggml_ext_execution_context {
 // not call ggml_backend_dev_supports_op recursively. A match consumes consecutive,
 // pure operators and writes only the final node, which may be a CPY. In-place
 // intermediates are allowed only when their storage is created within the match.
+// An in-place final node must overwrite that storage's complete layout without
+// external consumers of intermediate values.
 // A terminal CPY retains its write semantics; execute must handle input/output
 // storage overlap (including allocator reuse), using workspace when needed.
 // Returning zero declines.

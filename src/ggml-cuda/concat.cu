@@ -239,6 +239,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 template <bool permuted>
 static __global__ void concat_cast_f16_cuda(
         const float4 * prefix, const float4 * current, half2 * dst,
@@ -282,3 +283,5 @@ void ggml_cuda_op_concat_cast_f16(ggml_backend_cuda_context & ctx, const ggml_te
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+#endif

@@ -441,15 +441,42 @@ static bool ggml_ext_can_fuse(const ggml_cgraph * graph, int first, int count) {
         const auto * node = graph->nodes[i];
         const bool output = i == first + count - 1;
         const bool copy = output && node->op == GGML_OP_CPY;
-        if ((!copy && !ggml_ext_is_pure(node) && !ggml_ext_is_internal_write(graph, first, i)) ||
-            (output && node->view_src && !copy)) {
+        const bool internal_write = ggml_ext_is_internal_write(graph, first, i);
+        if ((!copy && !ggml_ext_is_pure(node) && !internal_write) ||
+            (output && node->view_src && !copy && !internal_write)) {
             return false;
         }
         indices.push_back(i);
         ops.push_back(node->op);
     }
-    int output = first + count - 1;
-    return ggml_can_fuse_subgraph_ext(graph, indices.data(), count, ops.data(), &output, 1);
+    int outputs[2] = { first + count - 1, -1 };
+    int n_outputs = 1;
+    const auto * output = graph->nodes[outputs[0]];
+    if (output->op != GGML_OP_CPY && ggml_ext_is_internal_write(graph, first, outputs[0])) {
+        const auto * owner = ggml_ext_storage(output);
+        if (output->type != owner->type || !ggml_are_same_shape(output, owner) ||
+            std::memcmp(output->nb, owner->nb, sizeof(output->nb)) != 0) {
+            return false;
+        }
+        for (const auto * view = output; view != owner; view = view->view_src) {
+            if (view->view_offs != 0) {
+                return false;
+            }
+        }
+        const int owner_idx = int(std::find(graph->nodes + first, graph->nodes + outputs[0], owner) - graph->nodes);
+        int uses = 0;
+        for (int i = owner_idx + 1; i <= outputs[0]; ++i) {
+            for (const auto * src : graph->nodes[i]->src) {
+                uses += src == owner;
+            }
+        }
+        if (uses != ggml_node_get_use_count(graph, owner_idx)) {
+            return false;
+        }
+        // Output flags propagate to view owners. The final write must replace their entire layout.
+        outputs[n_outputs++] = owner_idx;
+    }
+    return ggml_can_fuse_subgraph_ext(graph, indices.data(), count, ops.data(), outputs, n_outputs);
 }
 
 static void ggml_ext_optimize_native(ggml_backend_t backend, ggml_cgraph * graph, int first, int end,

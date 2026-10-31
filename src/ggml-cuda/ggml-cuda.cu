@@ -4607,6 +4607,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 static int ggml_cuda_can_fuse_concat_cast_f16(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * concat = cgraph->nodes[i];
     if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 || i + 1 >= cgraph->n_nodes) {
@@ -4642,6 +4643,7 @@ static int ggml_cuda_can_fuse_concat_cast_f16(const ggml_cgraph * cgraph, int i)
     }
     return count;
 }
+#endif
 
 
 #if defined(GGML_USE_HIP)
@@ -4770,6 +4772,7 @@ static bool ggml_cuda_can_fuse_rms_rope_scale_cast(const ggml_cgraph * cgraph, i
 
 #endif
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 static bool ggml_cuda_can_fuse_cont_scale_permute_cast(const ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes ||
         !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_SCALE, GGML_OP_PERMUTE, GGML_OP_CPY }, { i + 3 })) {
@@ -4790,6 +4793,7 @@ static bool ggml_cuda_can_fuse_cont_scale_permute_cast(const ggml_cgraph * cgrap
         ggml_get_op_params_i32(permute, 0) == 0 && ggml_get_op_params_i32(permute, 1) == 2 &&
         ggml_get_op_params_i32(permute, 2) == 1 && ggml_get_op_params_i32(permute, 3) == 3;
 }
+#endif
 
 
 
@@ -4856,6 +4860,7 @@ static bool ggml_cuda_can_fuse_i8_swiglu_convrot(const ggml_cgraph * cgraph, int
 
 #endif
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 static __global__ void gated_residual_f32_cuda(
         const float4 * x, const float4 * gate, const float4 * residual, float4 * dst, int64_t n4, int64_t count4) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -4867,7 +4872,9 @@ static __global__ void gated_residual_f32_cuda(
     dst[i] = make_float4(__fadd_rn(__fmul_rn(a.x, g.x), r.x), __fadd_rn(__fmul_rn(a.y, g.y), r.y),
                         __fadd_rn(__fmul_rn(a.z, g.z), r.z), __fadd_rn(__fmul_rn(a.w, g.w), r.w));
 }
+#endif
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 static bool ggml_cuda_try_fuse_gated_residual(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD })) {
         return false;
@@ -4902,6 +4909,7 @@ static bool ggml_cuda_try_fuse_gated_residual(ggml_backend_cuda_context & ctx, g
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+#endif
 
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4913,6 +4921,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     if (const int count = ggml_cuda_can_fuse_concat_cast_f16(cgraph, i)) {
         ggml_tensor * dst = cgraph->nodes[i + count - 1];
         const uintptr_t output_begin = (uintptr_t) dst->data;
@@ -4931,6 +4940,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return count - 1;
     }
+#endif
 #if defined(GGML_USE_HIP)
     if (ggml_cuda_can_fuse_scale_convrot(cgraph, i, cuda_ctx->device)) {
         ggml_tensor * dst = cgraph->nodes[i + 1];
@@ -5009,6 +5019,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 #endif
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     if (ggml_cuda_can_fuse_cont_scale_permute_cast(cgraph, i)) {
         ggml_tensor * dst = cgraph->nodes[i + 3];
         const int output_idx = i + 3;
@@ -5024,6 +5035,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return 3;
     }
+#endif
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     if (ggml_cuda_can_fuse_rms_rope_scale_cast(cgraph, i)) {
         ggml_tensor * dst = cgraph->nodes[i + 4];
@@ -5051,9 +5063,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 #endif
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     if (node->op == GGML_OP_MUL && ggml_cuda_try_fuse_gated_residual(*cuda_ctx, cgraph, i)) {
         return 1;
     }
+#endif
 #if defined(GGML_USE_HIP)
 
     if (ggml_cuda_can_fuse_i8_swiglu_convrot(cgraph, i, cuda_ctx->device)) {
@@ -6482,9 +6496,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             if (const int count = ggml_cuda_can_fuse_concat_cast_f16(cgraph, i)) {
                 add_alloc_deps(i, i + count - 1);
             }
+#endif
 #if defined(GGML_USE_HIP)
             if (ggml_cuda_can_fuse_scale_convrot(cgraph, i, cuda_ctx->device)) {
                 add_alloc_deps(i, i + 1);
@@ -6504,9 +6520,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 add_alloc_deps(i, i + 4);
             }
 #endif
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             if (ggml_cuda_can_fuse_cont_scale_permute_cast(cgraph, i)) {
                 add_alloc_deps(i, i + 3);
             }
+#endif
 
 #if defined(GGML_USE_HIP)
 

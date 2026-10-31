@@ -3,6 +3,7 @@
 
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 static __global__ void scale_permute_f16(const float * src, half * dst,
         int64_t dim, int64_t tokens, int64_t heads, int64_t count,
         int64_t nb1, int64_t nb2, int64_t nb3, float scale) {
@@ -28,6 +29,7 @@ void ggml_cuda_op_scale_permute_f16(ggml_backend_cuda_context & ctx, const ggml_
         src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), scale);
     CUDA_CHECK(cudaGetLastError());
 }
+#endif
 
 template <typename T>
 static __global__ void scale_f32(const T * x, T * dst, const float scale, const float bias, const int64_t nelements) {
