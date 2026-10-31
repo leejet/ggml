@@ -910,6 +910,7 @@ struct vk_mul_mat_i8_tensorwise_push_constants {
     uint32_t has_bias;
     uint32_t row_offset;
     float output_scale;
+    uint32_t group_cols;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {

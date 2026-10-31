@@ -7529,6 +7529,22 @@ static void ggml_vk_quantize_i8_convrot(
     }
 }
 
+static uint32_t ggml_vk_i8_matmul_group_cols(uint32_t cols, uint32_t k, uint32_t tile_cols, bool swiglu) {
+    if (cols == 0 || k == 0 || tile_cols == 0) {
+        return 1;
+    }
+    constexpr uint64_t panel_target_bytes = 8ull * 1024 * 1024;
+    constexpr uint64_t max_panel_growth = 2;
+    constexpr uint64_t max_group_cols = 32;
+    const uint64_t col_tiles = CEIL_DIV(uint64_t(cols), tile_cols);
+    const uint64_t weight_tile_bytes = uint64_t(tile_cols) * k * (swiglu ? 2 : 1);
+    // Larger panels favor activation reuse in contracting projections. The byte
+    // target counts both SwiGLU weights and is a heuristic, not the device's L2 size.
+    const uint64_t panel_growth = std::clamp(uint64_t(k) / cols, uint64_t(1), max_panel_growth);
+    return uint32_t(std::clamp(panel_target_bytes * panel_growth / weight_tile_bytes,
+                               uint64_t(1), std::min(col_tiles, max_group_cols)));
+}
+
 static void ggml_vk_mul_mat_i8_tensorwise(
         ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst, ggml_tensor * output = nullptr,
@@ -7567,6 +7583,8 @@ static void ggml_vk_mul_mat_i8_tensorwise(
             return;
         }
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const bool swiglu = output != nullptr && residual == nullptr;
+        const uint32_t cols = uint32_t(output != nullptr ? output->ne[0] : weight->ne[1]);
         const vk_mul_mat_i8_tensorwise_push_constants pc = {
             (uint32_t) weight->ne[1] * (up_mat != nullptr ? 2u : 1u),
             rows,
@@ -7574,6 +7592,7 @@ static void ggml_vk_mul_mat_i8_tensorwise(
             bias != nullptr ? 1u : 0u,
             row_offset,
             output_scale,
+            ggml_vk_i8_matmul_group_cols(cols, uint32_t(weight->ne[0]), pipeline->wg_denoms[0], swiglu),
         };
         if (up_mat != nullptr) {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -7597,9 +7616,11 @@ static void ggml_vk_mul_mat_i8_tensorwise(
     };
 
     if (ctx->device->pipeline_mul_mat_i8_tensorwise_cm2) {
+        const bool tall_contraction = rows >= weight->ne[1] && weight->ne[0] >= weight->ne[1];
+        const bool large_k_tile = weight->ne[0] % 4096 == 0 || tall_contraction;
         if (residual != nullptr) {
             const uint32_t full_rows = weight->ne[1] % 128 == 0 ? rows / 128 * 128 : 0;
-            dispatch(ctx->device->pipeline_mul_mat_i8_residual_cm2[weight->ne[0] % 4096 == 0 ? 1 : 2], 0, full_rows);
+            dispatch(ctx->device->pipeline_mul_mat_i8_residual_cm2[large_k_tile ? 1 : 2], 0, full_rows);
             auto tail = ctx->device->pipeline_mul_mat_i8_residual_cm2_tail;
             dispatch(tail && weight->ne[1] % 128 == 0 && rows - full_rows <= 32 ? tail : ctx->device->pipeline_mul_mat_i8_residual_cm2[0], full_rows, rows - full_rows);
             return;
@@ -7613,7 +7634,7 @@ static void ggml_vk_mul_mat_i8_tensorwise(
             return;
         }
         const uint32_t full_rows = weight->ne[1] % 128 == 0 ? rows / 128 * 128 : 0;
-        dispatch(ctx->device->pipeline_mul_mat_i8_tensorwise_cm2_aligned[weight->ne[0] % 4096 == 0 ? 1 : 0], 0, full_rows);
+        dispatch(ctx->device->pipeline_mul_mat_i8_tensorwise_cm2_aligned[large_k_tile ? 1 : 0], 0, full_rows);
         auto tail = ctx->device->pipeline_mul_mat_i8_tensorwise_cm2_tail;
         dispatch(tail && weight->ne[1] % 128 == 0 && rows - full_rows <= 32 ? tail : ctx->device->pipeline_mul_mat_i8_tensorwise_cm2, full_rows, rows - full_rows);
         return;

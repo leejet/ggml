@@ -21,9 +21,8 @@ layout(push_constant) uniform parameter
     uint k;
     uint has_bias;
     uint row_offset;
-#ifdef RESIDUAL
     float output_scale;
-#endif
+    uint group_cols;
 } p;
 
 layout(binding = 0, std430) readonly buffer W { int8_t data_w[]; };
@@ -87,7 +86,7 @@ void main() {
     // Keep a weight panel in L2 while visiting the activation tiles.
     const uint col_tiles = gl_NumWorkGroups.x;
     const uint row_tiles = gl_NumWorkGroups.y;
-    const uint group_cols = clamp((8 * 1024 * 1024 / BM) / p.k, 1u, min(col_tiles, 32u));
+    const uint group_cols = clamp(p.group_cols, 1u, col_tiles);
     const uint linear = gl_WorkGroupID.y * col_tiles + gl_WorkGroupID.x;
     const uint group = linear / (group_cols * row_tiles);
     const uint first_col = group * group_cols;
