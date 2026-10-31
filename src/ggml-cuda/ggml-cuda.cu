@@ -4681,7 +4681,7 @@ static int ggml_cuda_can_fuse_concat_cast_f16(const ggml_cgraph * cgraph, int i)
 }
 
 
-#if !defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
 static bool ggml_cuda_can_fuse_scale_convrot(const ggml_cgraph * cgraph, int i, int device) {
     const ggml_tensor * scale = cgraph->nodes[i];
     if (scale->op != GGML_OP_SCALE ||
@@ -4844,6 +4844,7 @@ static bool ggml_cuda_can_fuse_swiglu_convrot(const ggml_cgraph * cgraph, int i,
         (size_t) node->ne[0] * sizeof(float) + 128 <= ggml_cuda_info().devices[device].smpbo;
 }
 
+#if defined(GGML_USE_HIP)
 static bool ggml_cuda_can_fuse_unary_mul_convrot(const ggml_cgraph * cgraph, int i, int device, int mul_idx = -1) {
     mul_idx = mul_idx < 0 ? i + 1 : mul_idx;
     const int quant_idx = mul_idx + 1;
@@ -4871,6 +4872,8 @@ static bool ggml_cuda_can_fuse_unary_mul_convrot(const ggml_cgraph * cgraph, int
     return ggml_get_op_params_i32(quant, 0) == 256 && mul->ne[0] % 256 == 0 &&
         size_t(mul->ne[0]) * sizeof(float) + 128 <= ggml_cuda_info().devices[device].smpbo;
 }
+
+#endif
 
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
 static bool ggml_cuda_can_fuse_i8_swiglu(const ggml_cgraph * graph, int i, int device) {
@@ -5036,7 +5039,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return count - 1;
     }
-#if !defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
     if (ggml_cuda_can_fuse_scale_convrot(cgraph, i, cuda_ctx->device)) {
         ggml_tensor * dst = cgraph->nodes[i + 1];
         const ggml_tensor * x = node->src[0];
@@ -5169,8 +5172,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_mul_mat_i8(*cuda_ctx, node->src[0], node->src[1], node, cgraph->nodes[i + 2]);
         return 2;
     }
+#if defined(GGML_USE_HIP)
     const int activation_count = ggml_cuda_can_fuse_swiglu_convrot(cgraph, i, cuda_ctx->device) ? 2 :
         ggml_cuda_can_fuse_unary_mul_convrot(cgraph, i, cuda_ctx->device) ? 3 : 0;
+#else
+    const bool i8_epilogue = node->op == GGML_OP_GLU && node->src[0]->op == GGML_OP_MUL_MAT &&
+        node->src[0]->src[0]->type == GGML_TYPE_I8 && node->src[0]->src[2] && !node->src[0]->src[3];
+    const int activation_count = i8_epilogue && ggml_cuda_can_fuse_swiglu_convrot(cgraph, i, cuda_ctx->device) ? 2 : 0;
+#endif
     if (activation_count != 0) {
         ggml_tensor * activation = cgraph->nodes[i + activation_count - 2];
         ggml_tensor * dst = cgraph->nodes[i + activation_count - 1];
@@ -6379,7 +6388,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
         }
-#if !defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
         for (int i = 5; i < cgraph->n_nodes; ++i) {
             int indices[6];
             if (!ggml_cuda_match_rms_mod_convrot(cgraph, i, cuda_ctx->device, indices)) {
@@ -6449,7 +6458,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (const int count = ggml_cuda_can_fuse_concat_cast_f16(cgraph, i)) {
                 add_alloc_deps(i, i + count - 1);
             }
-#if !defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
             if (ggml_cuda_can_fuse_scale_convrot(cgraph, i, cuda_ctx->device)) {
                 add_alloc_deps(i, i + 1);
             }
@@ -6490,9 +6499,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 // The fused quantizer still reads the GLU inputs when its output is written.
                 add_alloc_deps(i, i + 1);
             }
+#if defined(GGML_USE_HIP)
             if (ggml_cuda_can_fuse_unary_mul_convrot(cgraph, i, cuda_ctx->device)) {
                 add_alloc_deps(i, i + 2);
             }
+#endif
 #endif
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
