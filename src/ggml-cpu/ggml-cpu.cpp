@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-ext.h"
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
@@ -684,7 +685,27 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static enum ggml_status ggml_backend_cpu_ext_parallel(ggml_backend_t backend, ggml_tensor * output,
+                                                      ggml_custom_op_t callback, void * user_data) {
+    if (!ggml_backend_is_cpu(backend) || !output || !callback) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_tensor node = *output;
+    ggml_custom_op_params params = { callback, GGML_N_TASKS_MAX, user_data };
+    node.op = GGML_OP_CUSTOM;
+    node.flags |= GGML_TENSOR_FLAG_COMPUTE;
+    memcpy(node.op_params, &params, sizeof(params));
+    ggml_tensor * nodes[] = { &node };
+    ggml_cgraph graph = {};
+    graph.n_nodes = 1;
+    graph.nodes = nodes;
+    return ggml_backend_cpu_graph_compute(backend, &graph);
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_ext_cpu_parallel_v1") == 0) {
+        return (void *) ggml_backend_cpu_ext_parallel;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

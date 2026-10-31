@@ -1,0 +1,90 @@
+#ifndef GGML_EXT_H
+#define GGML_EXT_H
+
+#include "ggml-backend.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define GGML_EXT_ABI_VERSION 1
+
+typedef const struct ggml_ext_op * ggml_ext_op_t;
+
+struct ggml_ext_tensor_desc {
+    enum ggml_type type;
+    int64_t ne[GGML_MAX_DIMS];
+};
+
+// Registrations and callback code must outlive all graphs and backends using them.
+// Operators are pure. Attributes are copied into op_params; tensor dependencies
+// must be explicit inputs. infer must fill all four positive output dimensions.
+struct ggml_ext_op_desc {
+    int abi_version;
+    const char * name;
+    size_t attributes_size;
+    bool (*infer)(struct ggml_tensor * const * inputs, int n_inputs, const void * attributes,
+                  struct ggml_ext_tensor_desc * output);
+};
+
+GGML_API ggml_ext_op_t ggml_ext_register_op(const struct ggml_ext_op_desc * desc);
+GGML_API struct ggml_tensor * ggml_ext_op_create(struct ggml_context * ctx, ggml_ext_op_t op,
+        struct ggml_tensor * const * inputs, int n_inputs, const void * attributes);
+GGML_API ggml_ext_op_t ggml_ext_op_get(const struct ggml_tensor * tensor);
+GGML_API const void * ggml_ext_op_attributes(const struct ggml_tensor * tensor);
+
+struct ggml_ext_execution_context {
+    int abi_version;
+    ggml_backend_t backend;
+    ggml_backend_buffer_t workspace;
+};
+
+// Single-node supports/preferred and fusion match inspect metadata only. They must
+// not call ggml_backend_dev_supports_op recursively. A match consumes consecutive,
+// pure, out-of-place nodes and writes only the final node. Returning zero declines.
+struct ggml_ext_kernel_desc {
+    int abi_version;
+    const char * name;
+    enum ggml_op op;
+    ggml_ext_op_t custom_op;
+    int priority;
+    bool (*supports)(ggml_backend_dev_t device, const struct ggml_tensor * node, void * user_data);
+    bool (*preferred)(ggml_backend_dev_t device, const struct ggml_tensor * node, void * user_data);
+    int (*match)(ggml_backend_dev_t device, const struct ggml_cgraph * graph, int first, void * user_data);
+    // prepare may run during measurement: host state only, no execution/device allocation.
+    enum ggml_status (*prepare)(ggml_backend_t backend, struct ggml_tensor * const * nodes, int n_nodes,
+                               void ** state, size_t * workspace_size, void * user_data);
+    enum ggml_status (*execute)(const struct ggml_ext_execution_context * context,
+                               struct ggml_tensor * const * nodes, int n_nodes, void * state, void * user_data);
+    // Paired with every prepare call, including failures and null state.
+    void (*destroy)(void * state, void * user_data);
+    void * user_data;
+};
+
+// Register before querying device capabilities or allocating graphs. No unloading
+// or replacing registrations while graphs are alive. Higher priorities run first.
+GGML_API bool ggml_ext_register_kernel(ggml_backend_dev_t device, const struct ggml_ext_kernel_desc * desc);
+
+// Query "ggml_ext_cuda_context_v1" through the CUDA registry's get_proc_address.
+// The returned stream is borrowed, ordered with native work, and must not be freed.
+struct ggml_ext_cuda_context {
+    // Physical runtime ordinal, including when ggml exposes virtual devices.
+    int device;
+    void * stream;
+};
+typedef bool (*ggml_ext_cuda_context_fn)(ggml_backend_t backend, struct ggml_ext_cuda_context * context);
+// Query "ggml_ext_cuda_device_v1" during capability checks, before backend creation.
+// Returns the physical runtime ordinal, or -1 for a non-CUDA device.
+typedef int (*ggml_ext_cuda_device_fn)(ggml_backend_dev_t device);
+
+// Query "ggml_ext_cpu_parallel_v1" to use the backend's configured thread pool.
+// The callback receives a temporary output descriptor; userdata can reference the
+// original nodes. Execution is synchronous and honors the CPU abort callback.
+typedef enum ggml_status (*ggml_ext_cpu_parallel_fn)(ggml_backend_t backend, struct ggml_tensor * output,
+                                                   ggml_custom_op_t callback, void * user_data);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

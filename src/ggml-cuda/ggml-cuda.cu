@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-ext.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -8259,8 +8260,33 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_ext_context(ggml_backend_t backend, ggml_ext_cuda_context * context) {
+    if (!context || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    context->device = ggml_cuda_info().devices[ctx->device].physical_device;
+    context->stream = (void *) ctx->stream();
+    return true;
+}
+
+static int ggml_backend_cuda_ext_device(ggml_backend_dev_t device) {
+    if (!device || device->iface.get_name != ggml_backend_cuda_device_get_name) {
+        return -1;
+    }
+    auto * ctx = (ggml_backend_cuda_device_context *) device->context;
+    return ggml_cuda_info().devices[ctx->device].physical_device;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_ext_cuda_context_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_context;
+    }
+    if (strcmp(name, "ggml_ext_cuda_device_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_device;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
