@@ -71,6 +71,21 @@ struct ggml_ext_kernel_desc {
 // Register before querying device capabilities or allocating graphs. No unloading
 // or replacing registrations while graphs are alive. Higher priorities run first.
 GGML_API bool ggml_ext_register_kernel(ggml_backend_dev_t device, const struct ggml_ext_kernel_desc * desc);
+enum ggml_ext_kernel_flags {
+    // execute enqueues replayable device work. After warmup, recording/replay may
+    // omit host calls. No required per-execution host side effects or decisions
+    // based on tensor contents; private streams must rejoin the borrowed stream.
+    GGML_EXT_KERNEL_CAPTURE_SAFE = 1,
+    // Requires CAPTURE_SAFE. Replay may outlive prepare/destroy and be reused by
+    // an equivalent rebuilt plan. Device work depends only on tensor metadata,
+    // addresses, the device and immutable registration data. Captured resources
+    // must belong to the backend or supplied workspace, never per-plan state.
+    // Workspace is scratch initialized by recorded work on every execution.
+    GGML_EXT_KERNEL_REPLAY_REUSABLE = 2,
+};
+// Existing registrations retain per-execution callbacks (flags = 0).
+GGML_API bool ggml_ext_register_kernel_ex(ggml_backend_dev_t device,
+        const struct ggml_ext_kernel_desc * desc, uint32_t flags);
 GGML_API bool ggml_ext_dev_supports_native_op(ggml_backend_dev_t device, const struct ggml_tensor * node);
 // Delay [first, first + count) until immediately before `before`. Refuses aliasing writes,
 // dependencies on the moved nodes, and unknown side effects in the crossed range.

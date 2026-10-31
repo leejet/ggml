@@ -17,6 +17,7 @@ struct ggml_ext_op {
 struct ggml_ext_kernel {
     std::string name;
     ggml_ext_kernel_desc desc;
+    uint32_t flags;
 };
 
 struct ggml_ext_registry {
@@ -98,9 +99,15 @@ const void * ggml_ext_op_attributes(const ggml_tensor * tensor) {
 }
 
 bool ggml_ext_register_kernel(ggml_backend_dev_t device, const ggml_ext_kernel_desc * desc) {
+    return ggml_ext_register_kernel_ex(device, desc, 0);
+}
+
+bool ggml_ext_register_kernel_ex(ggml_backend_dev_t device, const ggml_ext_kernel_desc * desc, uint32_t flags) {
     if (!device || !desc || desc->abi_version != GGML_EXT_ABI_VERSION || !desc->name || !desc->name[0] ||
         !desc->execute || (!desc->supports && !desc->match) || desc->op <= GGML_OP_NONE || desc->op >= GGML_OP_COUNT ||
-        (desc->custom_op && desc->op != GGML_OP_CUSTOM) || (desc->prepare && !desc->destroy)) {
+        (desc->custom_op && desc->op != GGML_OP_CUSTOM) || (desc->prepare && !desc->destroy) ||
+        (flags & ~uint32_t(GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE)) ||
+        ((flags & GGML_EXT_KERNEL_REPLAY_REUSABLE) && !(flags & GGML_EXT_KERNEL_CAPTURE_SAFE))) {
         return false;
     }
     auto & registry = ggml_ext_registry_get();
@@ -114,6 +121,7 @@ bool ggml_ext_register_kernel(ggml_backend_dev_t device, const ggml_ext_kernel_d
     std::unique_ptr<ggml_ext_kernel> kernel(new ggml_ext_kernel);
     kernel->name = desc->name;
     kernel->desc = *desc;
+    kernel->flags = flags;
     kernel->desc.name = kernel->name.c_str();
     kernels.push_back(std::move(kernel));
     std::stable_sort(kernels.begin(), kernels.end(), [](const std::unique_ptr<ggml_ext_kernel> & a,
@@ -173,7 +181,168 @@ struct ggml_ext_plan {
     ggml_status status = GGML_STATUS_SUCCESS;
     std::vector<ggml_ext_step> steps;
     uint64_t tail_uid;
+    const ggml_ext_graph_executor * executor = nullptr;
+    void * executor_state = nullptr;
+    bool reusable = false;
+    bool executed = false;
+    std::vector<char> replay_key;
 };
+
+struct ggml_ext_replay {
+    std::vector<char> key;
+    const ggml_ext_graph_executor * executor;
+    void * state;
+    ggml_backend_buffer_t workspace;
+    size_t workspace_size;
+};
+
+struct ggml_ext_replay_cache {
+    std::mutex mutex;
+    std::unordered_map<ggml_backend_t, std::vector<ggml_ext_replay>> entries;
+};
+
+static ggml_ext_replay_cache & ggml_ext_replay_cache_get() {
+    static ggml_ext_replay_cache cache;
+    return cache;
+}
+
+static void ggml_ext_replay_free(ggml_ext_replay & replay) {
+    replay.executor->destroy(replay.state);
+    ggml_backend_buffer_free(replay.workspace);
+}
+
+void ggml_ext_backend_free(ggml_backend_t backend) {
+    auto & cache = ggml_ext_replay_cache_get();
+    std::vector<ggml_ext_replay> entries;
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto it = cache.entries.find(backend);
+        if (it != cache.entries.end()) {
+            entries = std::move(it->second);
+            cache.entries.erase(it);
+        }
+    }
+    if (!entries.empty()) {
+        ggml_backend_synchronize(backend);
+        for (auto & replay : entries) {
+            ggml_ext_replay_free(replay);
+        }
+    }
+}
+
+template<typename T>
+static void ggml_ext_key_append(std::vector<char> & key, const T & value) {
+    const auto * bytes = reinterpret_cast<const char *>(&value);
+    key.insert(key.end(), bytes, bytes + sizeof(value));
+}
+
+static std::vector<char> ggml_ext_replay_key(const ggml_ext_plan * plan, const ggml_cgraph * graph) {
+    std::vector<char> key;
+    std::vector<const ggml_tensor *> tensors;
+    std::unordered_map<const ggml_tensor *, size_t> indices;
+    key.reserve(size_t(graph->n_nodes) * sizeof(ggml_tensor));
+    tensors.reserve(graph->n_nodes);
+    indices.reserve(graph->n_nodes);
+    const auto index = [&](const ggml_tensor * tensor) {
+        if (!tensor) {
+            return SIZE_MAX;
+        }
+        auto result = indices.emplace(tensor, tensors.size());
+        if (result.second) {
+            tensors.push_back(tensor);
+        }
+        return result.first->second;
+    };
+    ggml_ext_key_append(key, graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_ext_key_append(key, index(graph->nodes[i]));
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto * tensor = tensors[i];
+        ggml_ext_key_append(key, tensor->type);
+        ggml_ext_key_append(key, tensor->ne);
+        ggml_ext_key_append(key, tensor->nb);
+        ggml_ext_key_append(key, tensor->op);
+        if (const auto * op = ggml_ext_op_get(tensor)) {
+            ggml_ext_key_append(key, op);
+            const auto * attrs = static_cast<const char *>(ggml_ext_op_attributes(tensor));
+            key.insert(key.end(), attrs, attrs + op->desc.attributes_size);
+        } else {
+            ggml_ext_key_append(key, tensor->op_params);
+        }
+        ggml_ext_key_append(key, tensor->flags);
+        ggml_ext_key_append(key, tensor->name);
+        ggml_ext_key_append(key, tensor->data);
+        ggml_ext_key_append(key, tensor->buffer);
+        ggml_ext_key_append(key, tensor->extra);
+        ggml_ext_key_append(key, tensor->view_offs);
+        ggml_ext_key_append(key, index(tensor->view_src));
+        for (const auto * src : tensor->src) {
+            ggml_ext_key_append(key, index(src));
+        }
+    }
+    ggml_ext_key_append(key, plan->steps.size());
+    for (const auto & step : plan->steps) {
+        ggml_ext_key_append(key, step.first);
+        ggml_ext_key_append(key, step.nodes.size());
+        ggml_ext_key_append(key, step.kernel);
+        ggml_ext_key_append(key, step.workspace_size);
+    }
+    return key;
+}
+
+static void ggml_ext_replay_restore(ggml_ext_plan * plan) {
+    auto & cache = ggml_ext_replay_cache_get();
+    ggml_ext_replay replay = {};
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto found = cache.entries.find(plan->backend);
+        if (found != cache.entries.end()) {
+            auto & entries = found->second;
+            for (auto it = entries.begin(); it != entries.end(); ++it) {
+                if (it->executor == plan->executor && it->key == plan->replay_key) {
+                    replay = std::move(*it);
+                    entries.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+    if (replay.state) {
+        plan->executor->destroy(plan->executor_state);
+        plan->executor_state = replay.state;
+        plan->workspace = replay.workspace;
+    }
+}
+
+static void ggml_ext_replay_store(ggml_ext_plan * plan) {
+    const size_t budget = 256 * 1024 * 1024;
+    const size_t size = plan->workspace ? ggml_backend_buffer_get_size(plan->workspace) : 0;
+    if (size > budget) {
+        return;
+    }
+    auto & cache = ggml_ext_replay_cache_get();
+    std::vector<ggml_ext_replay> evicted;
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto & entries = cache.entries[plan->backend];
+        size_t bytes = size;
+        for (const auto & entry : entries) {
+            bytes += entry.workspace_size;
+        }
+        while (!entries.empty() && (entries.size() >= 16 || bytes > budget)) {
+            bytes -= entries.front().workspace_size;
+            evicted.push_back(std::move(entries.front()));
+            entries.erase(entries.begin());
+        }
+        entries.push_back({std::move(plan->replay_key), plan->executor, plan->executor_state, plan->workspace, size});
+    }
+    for (auto & replay : evicted) {
+        ggml_ext_replay_free(replay);
+    }
+    plan->executor_state = nullptr;
+    plan->workspace = nullptr;
+}
 
 bool ggml_ext_dev_supports_native_op(ggml_backend_dev_t device, const ggml_tensor * node) {
     return device && node && !ggml_ext_op_get(node) && device->iface.supports_op(device, node);
@@ -373,6 +542,20 @@ ggml_ext_plan * ggml_ext_plan_create(ggml_backend_t backend, ggml_cgraph * graph
         }
         step.workspace_size = GGML_PAD(workspace_size, ggml_backend_get_alignment(backend));
     }
+    if (params && allow_fusion && plan->status == GGML_STATUS_SUCCESS &&
+        std::all_of(plan->steps.begin(), plan->steps.end(), [](const ggml_ext_step & step) {
+            return (step.kernel->flags & GGML_EXT_KERNEL_CAPTURE_SAFE) != 0;
+        })) {
+        auto query = reinterpret_cast<ggml_ext_graph_executor_fn>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_ext_graph_executor_v1"));
+        plan->executor = query ? query(backend) : nullptr;
+        if (plan->executor) {
+            plan->executor_state = plan->executor->create(backend);
+            plan->reusable = std::all_of(plan->steps.begin(), plan->steps.end(), [](const ggml_ext_step & step) {
+                return (step.kernel->flags & GGML_EXT_KERNEL_REPLAY_REUSABLE) != 0;
+            });
+        }
+    }
     return plan.release();
 }
 
@@ -381,6 +564,12 @@ void ggml_ext_plan_free(ggml_ext_plan * plan) {
         return;
     }
     ggml_backend_synchronize(plan->backend);
+    if (plan->reusable && plan->executed && plan->executor_state) {
+        ggml_ext_replay_store(plan);
+    }
+    if (plan->executor_state) {
+        plan->executor->destroy(plan->executor_state);
+    }
     for (auto & step : plan->steps) {
         const auto & desc = step.kernel->desc;
         if (desc.destroy && step.prepared) {
@@ -401,17 +590,7 @@ size_t ggml_ext_plan_workspace_size(const ggml_ext_plan * plan) {
     return size;
 }
 
-ggml_status ggml_ext_plan_compute(ggml_ext_plan * plan, ggml_cgraph * graph) {
-    if (plan->status != GGML_STATUS_SUCCESS) {
-        return plan->status;
-    }
-    const size_t workspace_size = ggml_ext_plan_workspace_size(plan);
-    if (workspace_size && !plan->workspace) {
-        plan->workspace = ggml_backend_alloc_buffer(plan->backend, workspace_size);
-        if (!plan->workspace) {
-            return GGML_STATUS_ALLOC_FAILED;
-        }
-    }
+static ggml_status ggml_ext_plan_execute(ggml_ext_plan * plan, ggml_cgraph * graph) {
     int first = 0;
     for (auto & step : plan->steps) {
         if (first < step.first) {
@@ -437,4 +616,33 @@ ggml_status ggml_ext_plan_compute(ggml_ext_plan * plan, ggml_cgraph * graph) {
         return plan->backend->iface.graph_compute(plan->backend, &view);
     }
     return GGML_STATUS_SUCCESS;
+}
+
+ggml_status ggml_ext_plan_compute(ggml_ext_plan * plan, ggml_cgraph * graph) {
+    if (plan->status != GGML_STATUS_SUCCESS) {
+        return plan->status;
+    }
+    if (plan->reusable) {
+        plan->replay_key = ggml_ext_replay_key(plan, graph);
+        if (!plan->executed && !plan->workspace) {
+            ggml_ext_replay_restore(plan);
+        }
+    }
+    const size_t workspace_size = ggml_ext_plan_workspace_size(plan);
+    if (workspace_size && !plan->workspace) {
+        plan->workspace = ggml_backend_alloc_buffer(plan->backend, workspace_size);
+        if (!plan->workspace) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+    }
+    if (plan->executor_state) {
+        struct invocation { ggml_ext_plan * plan; ggml_cgraph * graph; } call = {plan, graph};
+        auto status = plan->executor->compute(plan->executor_state, graph, [](void * opaque) {
+            auto * call = static_cast<invocation *>(opaque);
+            return ggml_ext_plan_execute(call->plan, call->graph);
+        }, &call);
+        plan->executed = status == GGML_STATUS_SUCCESS;
+        return status;
+    }
+    return ggml_ext_plan_execute(plan, graph);
 }

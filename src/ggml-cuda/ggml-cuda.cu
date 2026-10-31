@@ -1,7 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
-#include "ggml-ext.h"
+#include "ggml-ext-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -6195,7 +6195,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        ggml_cuda_graph * graph = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
@@ -6248,10 +6248,17 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static thread_local ggml_backend_cuda_context * ggml_cuda_ext_active_ctx = nullptr;
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ggml_cuda_ext_active_ctx == cuda_ctx) {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+        return GGML_STATUS_SUCCESS;
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6310,6 +6317,143 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     return GGML_STATUS_SUCCESS;
 }
+
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct ggml_cuda_ext_graph {
+    ggml_backend_cuda_context * ctx;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t instance = nullptr;
+    cudaStream_t stream = nullptr;
+    std::vector<const void *> addresses;
+    bool checked = false;
+    bool compatible = false;
+    bool warmed = false;
+
+    void reset() {
+        if (instance) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance = nullptr;
+        }
+        if (graph) {
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            graph = nullptr;
+        }
+        warmed = false;
+    }
+};
+
+static void * ggml_cuda_ext_graph_create(ggml_backend_t backend) {
+    return new ggml_cuda_ext_graph{static_cast<ggml_backend_cuda_context *>(backend->context)};
+}
+
+static void ggml_cuda_ext_graph_destroy(void * opaque) {
+    auto * state = static_cast<ggml_cuda_ext_graph *>(opaque);
+    ggml_cuda_set_device(state->ctx->device);
+    state->reset();
+    delete state;
+}
+
+static ggml_status ggml_cuda_ext_graph_compute(void * opaque, ggml_cgraph * graph,
+        ggml_ext_graph_callback callback, void * user_data) {
+    auto & state = *static_cast<ggml_cuda_ext_graph *>(opaque);
+    auto * ctx = state.ctx;
+    ggml_cuda_set_device(ctx->device);
+    if (!state.checked) {
+        state.compatible = ggml_cuda_info().devices[ctx->device].cc >= GGML_CUDA_CC_VOLTA &&
+            ggml_cuda_graph_check_compability(graph);
+        state.checked = true;
+    }
+    if (!state.compatible) {
+        return callback(user_data);
+    }
+    const auto execute = [&]() {
+        auto * previous = ggml_cuda_ext_active_ctx;
+        ggml_cuda_ext_active_ctx = ctx;
+        auto status = callback(user_data);
+        ggml_cuda_ext_active_ctx = previous;
+        return status;
+    };
+    auto stream = ctx->stream();
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) {
+        return GGML_STATUS_FAILED;
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
+        return execute();
+    }
+    // A plan freezes metadata, but scheduler allocations and externally bound
+    // tensor addresses can change without changing the ggml graph UID.
+    const bool first_execution = state.addresses.empty();
+    bool changed = state.stream != stream;
+    state.stream = stream;
+    std::vector<const void *> addresses;
+    addresses.reserve(graph->n_nodes * (GGML_MAX_SRC + 1));
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        addresses.push_back(graph->nodes[i]->data);
+        for (const auto * src : graph->nodes[i]->src) {
+            addresses.push_back(src ? src->data : nullptr);
+        }
+    }
+    changed |= state.addresses != addresses;
+    state.addresses = std::move(addresses);
+    if (changed) {
+        state.reset();
+    }
+    if (!state.warmed) {
+        // Keep fragment caches useful when a whole plan is never reused. After
+        // rebinding, bypass them because their UID can still describe old data.
+        auto status = first_execution ? callback(user_data) : execute();
+        state.warmed = status == GGML_STATUS_SUCCESS;
+        return status;
+    }
+    if (!state.instance) {
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto error = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
+        ggml_status status = GGML_STATUS_FAILED;
+        if (error == cudaSuccess) {
+            status = execute();
+            error = cudaStreamEndCapture(stream, &state.graph);
+        }
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+        if (status != GGML_STATUS_SUCCESS || error != cudaSuccess) {
+            state.reset();
+            (void) cudaGetLastError();
+            return status != GGML_STATUS_SUCCESS ? status : GGML_STATUS_FAILED;
+        }
+        if (cudaGraphInstantiate(&state.instance, state.graph, nullptr, nullptr, 0) != cudaSuccess) {
+            state.reset();
+            return GGML_STATUS_FAILED;
+        }
+    }
+    return cudaGraphLaunch(state.instance, stream) == cudaSuccess ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+}
+
+static const ggml_ext_graph_executor * ggml_backend_cuda_ext_graph_executor(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_cuda(backend) || getenv("GGML_CUDA_DISABLE_GRAPHS")) {
+        return nullptr;
+    }
+#if defined(GGML_USE_VMM)
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!ggml_cuda_info().devices[ctx->device].vmm) {
+        return nullptr;
+    }
+#else
+    return nullptr;
+#endif
+    static const ggml_ext_graph_executor executor = {
+        ggml_cuda_ext_graph_create, ggml_cuda_ext_graph_compute, ggml_cuda_ext_graph_destroy,
+    };
+    return &executor;
+}
+#endif
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
@@ -7837,6 +7981,11 @@ static int ggml_backend_cuda_ext_device(ggml_backend_dev_t device) {
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_ext_graph_executor_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_graph_executor;
+    }
+#endif
     if (strcmp(name, "ggml_ext_cuda_context_v1") == 0) {
         return (void *) ggml_backend_cuda_ext_context;
     }

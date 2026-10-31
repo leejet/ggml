@@ -383,6 +383,7 @@ void ggml_backend_free(ggml_backend_t backend) {
         return;
     }
 
+    ggml_ext_backend_free(backend);
     backend->iface.free(backend);
 }
 
