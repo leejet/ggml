@@ -460,21 +460,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
             if (src0->type == GGML_TYPE_I8) {
-                const ggml_tensor * weight_scale = op->src[2];
-                const ggml_tensor * bias         = op->src[3];
-                const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
-                const bool packed_input          = ggml_mul_mat_has_packed_i8_input(op);
-                return (src1->type == GGML_TYPE_F32 || packed_input) && op->type == GGML_TYPE_F32 &&
-                       src0->ne[2] == 1 && src0->ne[3] == 1 &&
-                       ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
-                       (weight_scale == nullptr ||
-                        (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) &&
-                         ggml_nelements(weight_scale) == src0->ne[1])) &&
-                       (bias == nullptr ||
-                        (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
-                         ggml_nelements(bias) == src0->ne[1])) &&
-                       (convrot_group_size == 0 ||
-                        (convrot_group_size <= 256 && src0->ne[0] % convrot_group_size == 0));
+                return false;
             }
             // BF16 in src1 is widened into the F32 work buffer
             return src1->type == GGML_TYPE_F32 ||
@@ -483,12 +469,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_ROPE_APPLY:
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
-        case GGML_OP_QUANTIZE_I8_CONVROT: {
-            const int group_size = ggml_get_op_params_i32(op, 0);
-            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
-                   group_size > 0 && group_size <= 256 && src0->ne[0] % group_size == 0;
-        }
+        case GGML_OP_QUANTIZE_I8_CONVROT:
+            return false;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
