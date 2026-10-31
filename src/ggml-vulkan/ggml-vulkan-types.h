@@ -659,6 +659,10 @@ class vk_memory_logger;
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
+    bool buffer_cache_enabled = false;
+    size_t buffer_cache_bytes = 0;
+    size_t backend_count = 0;
+    std::vector<vk_buffer> buffer_cache;
 
     // Guards compile_pending, all_pipelines, and the dynamic pipeline maps
     // (flash_attn, fa_mask_opt, solve_tri, conv2d, etc). The actual compile

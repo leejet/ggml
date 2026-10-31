@@ -4292,10 +4292,14 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_SUBALLOCATION_BLOCK_SIZE != nullptr) {
             device->suballocation_block_size = std::stoull(GGML_VK_SUBALLOCATION_BLOCK_SIZE);
         } else {
-            // Limit batching of allocations to 1GB by default to avoid fragmentation issues
-            device->suballocation_block_size = 1024*1024*1024;
+            // Larger chunks avoid stranding space between large attention intermediates.
+            const bool nvidia_discrete = device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+                device->properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+            device->suballocation_block_size = size_t(nvidia_discrete ? 4 : 1) * 1024 * 1024 * 1024;
         }
-        device->suballocation_block_size = std::min(device->suballocation_block_size, device->max_memory_allocation_size);
+        device->suballocation_block_size = std::min({device->suballocation_block_size,
+                                                    device->max_memory_allocation_size,
+                                                    device->max_buffer_size});
 
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
@@ -5014,7 +5018,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         }
 
         // publish the device only when it is fully built
-        vk_instance.devices[idx] = device;
+        std::atomic_store(&vk_instance.devices[idx], device);
 
         return device;
     }
@@ -13529,9 +13533,32 @@ bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
     return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
 }
 
+static void ggml_vk_clear_buffer_cache(const vk_device & device) {
+    for (auto & buffer : device->buffer_cache) {
+        ggml_vk_destroy_buffer(buffer);
+    }
+    device->buffer_cache.clear();
+    device->buffer_cache_bytes = 0;
+}
+
 void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    auto device = ctx->device.lock();
+    if (!device) {
+        ggml_vk_destroy_buffer(ctx->dev_buffer);
+        delete ctx;
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    constexpr size_t cache_limit = size_t(1024) * 1024 * 1024;
+    if (device->buffer_cache_enabled && device->backend_count > 0 && ctx->dev_buffer &&
+        ctx->dev_buffer.use_count() == 1 && ctx->dev_buffer->size > 0 &&
+        ctx->dev_buffer->size <= cache_limit - device->buffer_cache_bytes &&
+        (ctx->dev_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+        device->buffer_cache_bytes += ctx->dev_buffer->size;
+        device->buffer_cache.push_back(std::move(ctx->dev_buffer));
+    }
     ggml_vk_destroy_buffer(ctx->dev_buffer);
     delete ctx;
 }
@@ -13653,10 +13680,27 @@ const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft) {
 ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
 
     vk_buffer dev_buffer = nullptr;
+    if (ctx->device->buffer_cache_enabled) {
+        auto & cache = ctx->device->buffer_cache;
+        auto found = std::find_if(cache.begin(), cache.end(), [size](const vk_buffer & buffer) {
+            return buffer->size == size;
+        });
+        if (found != cache.end()) {
+            dev_buffer = std::move(*found);
+            cache.erase(found);
+            ctx->device->buffer_cache_bytes -= size;
+        } else {
+            // Release idle allocations before growing the device working set.
+            ggml_vk_clear_buffer_cache(ctx->device);
+        }
+    }
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        if (!dev_buffer) {
+            dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        }
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
@@ -13769,6 +13813,13 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
     ggml_vk_cleanup(ctx);
+    {
+        std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+        if (--ctx->device->backend_count == 0) {
+            ggml_vk_clear_buffer_cache(ctx->device);
+            ctx->device->buffer_cache_enabled = false;
+        }
+    }
 
     delete ctx;
     delete backend;
@@ -16301,6 +16352,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
+    {
+        std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+        ++ctx->device->backend_count;
+    }
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),
@@ -16334,11 +16389,14 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
 
-    vk::PhysicalDevice vkdev = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+    const auto initialized = std::atomic_load(&vk_instance.devices[device]);
+    vk::PhysicalDevice vkdev = initialized ? initialized->physical_device :
+        vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
     vk::PhysicalDeviceMemoryProperties2 memprops = {};
     const bool membudget_supported = vk_instance.device_supports_membudget[device];
-    const bool is_integrated_gpu = vkdev.getProperties().deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+    const bool is_integrated_gpu = (initialized ? initialized->properties.deviceType : vkdev.getProperties().deviceType) ==
+        vk::PhysicalDeviceType::eIntegratedGpu;
 
     if (membudget_supported) {
         memprops.pNext = &budgetprops;
@@ -16362,6 +16420,12 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             } else {
                 *free += heap.size;
             }
+        }
+    }
+    if (membudget_supported) {
+        if (initialized) {
+            std::lock_guard<std::recursive_mutex> guard(initialized->mutex);
+            *free += std::min(initialized->buffer_cache_bytes, *total - std::min(*free, *total));
         }
     }
 }
@@ -17341,11 +17405,39 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void ggml_backend_vk_set_buffer_cache_enabled(ggml_backend_t backend, bool enabled) {
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+    const char * reuse = getenv("GGML_VK_REUSE_BUFFERS");
+    ctx->device->buffer_cache_enabled = enabled && !ctx->device->uma && !ctx->device->prefer_host_memory &&
+        (reuse == nullptr || strcmp(reuse, "0") != 0);
+    if (!ctx->device->buffer_cache_enabled) {
+        ggml_vk_clear_buffer_cache(ctx->device);
+    }
+}
+
+static void ggml_backend_vk_clear_buffer_cache(ggml_backend_t backend) {
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+    ggml_vk_clear_buffer_cache(ctx->device);
+}
+
+static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_set_buffer_cache_enabled") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_vk_set_buffer_cache_enabled);
+    }
+    if (strcmp(name, "ggml_backend_clear_buffer_cache") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_vk_clear_buffer_cache);
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
