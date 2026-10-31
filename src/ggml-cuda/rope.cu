@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 template <int D, bool interleaved, typename T>
 static __global__ void rms_norm_mul_rope_apply_fused(
         const float * x, const float * weight, const float * pe, T * dst,
@@ -174,6 +175,8 @@ void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             x->ne[0]/2, pe->ne[2], x->ne[1], x->ne[2], pairs, strides);
     }
 }
+
+#endif
 
 struct rope_corr_dims {
     float v[2];

@@ -2,6 +2,7 @@
 
 #define CUDA_ROPE_BLOCK_SIZE 256
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_mul_rope_apply_fused(ggml_backend_cuda_context & ctx,
@@ -9,6 +10,8 @@ void ggml_cuda_op_rms_norm_mul_rope_apply_fused(ggml_backend_cuda_context & ctx,
 
 void ggml_cuda_op_rms_norm_mul_rope_apply_f16(ggml_backend_cuda_context & ctx,
         ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope, half * output, float scale);
+
+#endif
 
 void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

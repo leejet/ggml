@@ -41,7 +41,10 @@ struct ggml_ext_execution_context {
 
 // Single-node supports/preferred and fusion match inspect metadata only. They must
 // not call ggml_backend_dev_supports_op recursively. A match consumes consecutive,
-// pure, out-of-place nodes and writes only the final node. Returning zero declines.
+// pure, out-of-place nodes and writes only the final node, which may be a CPY.
+// A terminal CPY retains its write semantics; execute must handle input/output
+// storage overlap (including allocator reuse), using workspace when needed.
+// Returning zero declines.
 struct ggml_ext_kernel_desc {
     int abi_version;
     const char * name;

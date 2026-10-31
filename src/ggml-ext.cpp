@@ -256,7 +256,9 @@ static bool ggml_ext_can_fuse(const ggml_cgraph * graph, int first, int count) {
     std::vector<ggml_op> ops;
     for (int i = first; i < first + count; ++i) {
         const auto * node = graph->nodes[i];
-        if (!ggml_ext_is_pure(node) || (i == first + count - 1 && node->view_src)) {
+        const bool output = i == first + count - 1;
+        const bool copy = output && node->op == GGML_OP_CPY;
+        if ((!copy && !ggml_ext_is_pure(node)) || (output && node->view_src && !copy)) {
             return false;
         }
         indices.push_back(i);

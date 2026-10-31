@@ -3386,9 +3386,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SOFT_MAX_BACK:
             ggml_cuda_op_soft_max_back(ctx, dst);
             break;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         case GGML_OP_ROPE_APPLY:
             ggml_cuda_op_rope_apply(ctx, dst);
             break;
+#endif
         case GGML_OP_ROPE:
             ggml_cuda_op_rope(ctx, dst);
             break;
@@ -4787,6 +4789,7 @@ static bool ggml_cuda_can_fuse_rms_norm_mul_rope_apply(const ggml_cgraph * cgrap
         x->nb[0] == sizeof(float) && ggml_is_contiguous(weight) && ggml_is_contiguous(pe) && ggml_is_contiguous(rope);
 }
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 static bool ggml_cuda_can_fuse_rms_rope_scale_cast(const ggml_cgraph * cgraph, int i) {
     if (i + 4 >= cgraph->n_nodes || !ggml_cuda_can_fuse_rms_norm_mul_rope_apply(cgraph, i) ||
         !ggml_can_fuse_subgraph(cgraph, i,
@@ -4801,6 +4804,8 @@ static bool ggml_cuda_can_fuse_rms_rope_scale_cast(const ggml_cgraph * cgraph, i
         ggml_get_op_params_f32(scale, 1) == 0.0f &&
         ggml_are_same_shape(rope, cast) && ggml_is_contiguous(cast);
 }
+
+#endif
 
 static bool ggml_cuda_can_fuse_cont_scale_permute_cast(const ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes ||
@@ -5370,6 +5375,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return 3;
     }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     if (ggml_cuda_can_fuse_rms_rope_scale_cast(cgraph, i)) {
         ggml_tensor * dst = cgraph->nodes[i + 4];
         const int output_idx = i + 4;
@@ -5395,6 +5401,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return 2;
     }
+#endif
 #if defined(GGML_CUDA_USE_CUTLASS) && !defined(GGML_CUDA_FORCE_CUBLAS)
     if (const int count = ggml_cuda_try_fuse_i8_gated_residual(*cuda_ctx, cgraph, i)) {
         return count - 1;
@@ -6705,12 +6712,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 add_alloc_deps(i, i + 2);
             }
 #endif
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             if (ggml_cuda_can_fuse_rms_norm_mul_rope_apply(cgraph, i)) {
                 add_alloc_deps(i, i + 2);
             }
             if (ggml_cuda_can_fuse_rms_rope_scale_cast(cgraph, i)) {
                 add_alloc_deps(i, i + 4);
             }
+#endif
             if (ggml_cuda_can_fuse_cont_scale_permute_cast(cgraph, i)) {
                 add_alloc_deps(i, i + 3);
             }
@@ -7778,8 +7787,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
             return false;
         case GGML_OP_ROPE_APPLY:
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+#else
+            return false;
+#endif
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
