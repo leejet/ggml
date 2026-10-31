@@ -603,7 +603,6 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_QUANTIZE_I8_CONVROT,
         GGML_OP_SAGE_ATTN,
         GGML_OP_SOL_ATTN,
 
@@ -1491,14 +1490,6 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-    GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * weight,
-            struct ggml_tensor  * input,
-            struct ggml_tensor  * weight_scale,
-            struct ggml_tensor  * bias,
-            int                   convrot_group_size);
-
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
@@ -1510,12 +1501,6 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
-
-    // Packs row-wise I8 activations followed by one F32 scale per row.
-    GGML_API struct ggml_tensor * ggml_quantize_i8_convrot(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   group_size);
 
     // indirect matrix multiplication
     //

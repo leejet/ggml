@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-vulkan.h"
+#include "ggml-ext-vulkan.h"
 
 #include <vulkan/vulkan_core.h>
 
@@ -732,6 +733,8 @@ struct vk_device_struct {
     // floor(log2(maxComputeWorkGroupInvocations))
     uint32_t max_workgroup_size_log2 {};
 
+    std::vector<ggml_ext_vulkan_matrix_properties> extension_matrix_properties;
+
     bool coopmat_support;
     bool coopmat_acc_f32_support {};
     bool coopmat_acc_f16_support {};
@@ -750,8 +753,6 @@ struct vk_device_struct {
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
-    bool coopmat2_i8_support {};
-    bool coopmat2_i8_small_support {};
     bool coopmat2_decode_vector;
 
     bool dot2_f16 {};
@@ -794,28 +795,9 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
-    vk_pipeline pipeline_quantize_i8_convrot;
-    vk_pipeline pipeline_quantize_i8_convrot_subgroup;
-    std::map<uint32_t, vk_pipeline> pipeline_quantize_i8_convrot_register;
-    vk_pipeline pipeline_swiglu_quantize_i8_convrot;
-    vk_pipeline pipeline_swiglu_quantize_i8_convrot_16384;
-    vk_pipeline pipeline_sigmoid_quantize_i8_convrot_6144;
     vk_pipeline pipeline_fa_pad_kv;
-    vk_pipeline pipeline_modulate_convrot[2][3];
-    vk_pipeline pipeline_rms_modulate_convrot;
     vk_pipeline pipeline_concat_cast_f16;
     vk_pipeline pipeline_scale_cast_f16;
-    vk_pipeline pipeline_mul_mat_i8_tensorwise;
-    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
-    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2;
-    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2_aligned[2];
-    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2_tail;
-    vk_pipeline pipeline_mul_mat_i8_swiglu_cm2[2];
-    vk_pipeline pipeline_mul_mat_i8_residual_cm2[3];
-    vk_pipeline pipeline_mul_mat_i8_residual_cm2_tail;
-    vk_pipeline pipeline_mul_mat_i8_swiglu_cm2_tail;
-    vk_pipeline pipeline_mul_mat_i8_swiglu_split_cm2[2];
-    vk_pipeline pipeline_mul_mat_i8_swiglu_split_cm2_tail;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1318,13 +1300,6 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
-    bool fused_i8_swiglu = false;
-    bool fused_i8_swiglu_split = false;
-    bool fused_i8_residual = false;
-    bool fused_i8_row_concat = false;
-    bool fused_modulate_convrot = false;
-    bool fused_swiglu_convrot = false;
-    bool fused_sigmoid_convrot = false;
     bool fused_concat_cast_f16 = false;
     bool fused_scale_cast_f16 = false;
     bool fused_fa_scale = false;

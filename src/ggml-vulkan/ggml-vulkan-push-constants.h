@@ -862,21 +862,6 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
-struct vk_quantize_i8_convrot_push_constants {
-    uint32_t k;
-    uint32_t rows;
-};
-
-struct vk_modulate_convrot_push_constants {
-    uint32_t rows;
-    uint32_t x_offset;
-    uint32_t m_offset;
-    uint32_t h_offset;
-    float eps;
-    uint32_t k;
-    uint32_t w_offset;
-};
-
 struct vk_concat_cast_f16_push_constants {
     uint32_t prefix, tokens, heads, batches;
     uint32_t a_stride[3], b_stride[3];
@@ -888,16 +873,6 @@ struct vk_scale_cast_f16_push_constants {
     uint32_t stride[3];
     uint32_t x_offset, d_offset;
     float scale, bias;
-};
-
-struct vk_mul_mat_i8_tensorwise_push_constants {
-    uint32_t n;
-    uint32_t rows;
-    uint32_t k;
-    uint32_t has_bias;
-    uint32_t row_offset;
-    float output_scale;
-    uint32_t group_cols;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {

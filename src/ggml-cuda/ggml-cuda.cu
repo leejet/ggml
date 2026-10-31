@@ -6434,8 +6434,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
-        case GGML_OP_QUANTIZE_I8_CONVROT:
-            return false;
 
         default:
             return false;

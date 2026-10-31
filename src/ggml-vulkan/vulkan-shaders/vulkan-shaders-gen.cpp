@@ -959,20 +959,9 @@ void process_shaders() {
     string_to_spv("fa_pad_kv", "fa_pad_kv.comp", {});
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-    string_to_spv("quantize_i8_convrot", "quantize_i8_convrot.comp", {});
-    string_to_spv("quantize_i8_convrot_subgroup", "quantize_i8_convrot_subgroup.comp", {});
-    string_to_spv("quantize_i8_convrot_register", "quantize_i8_convrot_subgroup.comp", {{"SINGLE_PASS", "1"}});
-    string_to_spv("swiglu_quantize_i8_convrot", "quantize_i8_convrot_subgroup.comp", {{"SWIGLU", "1"}});
-    string_to_spv("swiglu_quantize_i8_convrot_16384", "quantize_i8_convrot_subgroup.comp", {{"SWIGLU", "1"}, {"SINGLE_PASS", "1"}, {"STATIC_K", "16384"}});
-    string_to_spv("sigmoid_quantize_i8_convrot_6144", "quantize_i8_convrot_subgroup.comp", {{"SIGMOID_MUL", "1"}, {"SINGLE_PASS", "1"}, {"STATIC_K", "6144"}});
-    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise.comp", {});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm1.comp", {}, true, true);
 #endif
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm2.comp", {}, true, false, true);
-    string_to_spv("mul_mat_i8_swiglu_split", "mul_mat_i8_tensorwise_cm2.comp", {{"SPLIT_SWIGLU", "1"}}, true, false, true);
-    string_to_spv("mul_mat_i8_residual", "mul_mat_i8_tensorwise_cm2.comp", {{"RESIDUAL", "1"}}, true, false, true);
 #endif
 #endif
 
@@ -1110,8 +1099,6 @@ void process_shaders() {
     string_to_spv("soft_max_large2_f32_f16", "soft_max_large2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_large3_f32_f16", "soft_max_large3.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
 
-    string_to_spv("modulate_convrot", "modulate_convrot.comp", {});
-    string_to_spv("rms_modulate_convrot", "modulate_convrot.comp", {{"RMS_AFFINE", "1"}});
 
     string_to_spv("rope_norm_f32", "rope_norm.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
     string_to_spv("rope_norm_f16", "rope_norm.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});

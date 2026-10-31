@@ -27,6 +27,32 @@ struct ggml_ext_vulkan_device_info {
     bool fusion_disabled;
 };
 
+// Metadata-only services queried as "ggml_ext_vulkan_compute_v1".
+struct ggml_ext_vulkan_compute_info {
+    uint32_t shared_memory;
+    bool subgroup_arithmetic;
+    bool graph_optimization_disabled;
+};
+
+struct ggml_ext_vulkan_matrix_properties {
+    enum ggml_type a, b, accumulator, result;
+    // Exact dimensions for subgroup matrices, granularities for flexible matrices.
+    uint32_t m, n, k;
+    // Workgroup invocation count, or the device subgroup size for subgroup scope.
+    uint32_t invocations;
+    bool workgroup_scope;
+    bool flexible;
+    bool saturating;
+};
+
+struct ggml_ext_vulkan_compute_api {
+    bool (*properties)(ggml_backend_dev_t device, struct ggml_ext_vulkan_compute_info * info);
+    // Enumerates enabled, representable matrix types; false marks the end or an invalid request.
+    bool (*matrix_properties)(ggml_backend_dev_t device, uint32_t index,
+                               struct ggml_ext_vulkan_matrix_properties * properties);
+};
+typedef const struct ggml_ext_vulkan_compute_api * (*ggml_ext_vulkan_compute_api_fn)(void);
+
 // SPIR-V uses entry point "main", contiguous storage-buffer bindings starting
 // at zero, and uint32 specialization constants with consecutive constant IDs.
 // The backend caches a copy of the complete shader/configuration until device
