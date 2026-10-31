@@ -10,6 +10,9 @@ struct ggml_ext_plan;
 // Query "ggml_ext_graph_executor_v1"; reusable state can outlive a plan and must
 // not retain graph pointers. Destruction follows synchronization. compute must
 // propagate callback errors without retrying execution.
+// Query "ggml_ext_graph_batch_v1" for submission batching without replay. Its
+// compute must invoke the callback exactly once per call; state is never reused
+// across plans. Batching does not require capture-safe extension kernels.
 typedef ggml_status (*ggml_ext_graph_callback)(void * user_data);
 struct ggml_ext_graph_executor {
     void * (*create)(ggml_backend_t backend);

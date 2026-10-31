@@ -569,16 +569,23 @@ ggml_ext_plan * ggml_ext_plan_create(ggml_backend_t backend, ggml_cgraph * graph
         }
         step.workspace_size = GGML_PAD(workspace_size, ggml_backend_get_alignment(backend));
     }
-    if (params && allow_fusion && plan->status == GGML_STATUS_SUCCESS &&
-        std::all_of(plan->steps.begin(), plan->steps.end(), [](const ggml_ext_step & step) {
+    if (params && allow_fusion && plan->status == GGML_STATUS_SUCCESS) {
+        const bool capture_safe = std::all_of(plan->steps.begin(), plan->steps.end(), [](const ggml_ext_step & step) {
             return (step.kernel->flags & GGML_EXT_KERNEL_CAPTURE_SAFE) != 0;
-        })) {
+        });
+        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         auto query = reinterpret_cast<ggml_ext_graph_executor_fn>(ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_ext_graph_executor_v1"));
-        plan->executor = query ? query(backend) : nullptr;
+                reg, "ggml_ext_graph_executor_v1"));
+        plan->executor = capture_safe && query ? query(backend) : nullptr;
+        const bool replay = plan->executor != nullptr;
+        if (!plan->executor) {
+            query = reinterpret_cast<ggml_ext_graph_executor_fn>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_ext_graph_batch_v1"));
+            plan->executor = query ? query(backend) : nullptr;
+        }
         if (plan->executor) {
             plan->executor_state = plan->executor->create(backend);
-            plan->reusable = std::all_of(plan->steps.begin(), plan->steps.end(), [](const ggml_ext_step & step) {
+            plan->reusable = replay && std::all_of(plan->steps.begin(), plan->steps.end(), [](const ggml_ext_step & step) {
                 return (step.kernel->flags & GGML_EXT_KERNEL_REPLAY_REUSABLE) != 0;
             });
         }

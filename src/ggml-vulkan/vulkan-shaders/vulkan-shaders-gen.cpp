@@ -1110,9 +1110,6 @@ void process_shaders() {
     string_to_spv("soft_max_large2_f32_f16", "soft_max_large2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_large3_f32_f16", "soft_max_large3.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
 
-    string_to_spv("rope_apply_f32", "rope_apply.comp", {});
-    string_to_spv("rms_rope_apply_f32", "rms_rope_apply.comp", {});
-    string_to_spv("rms_rope_apply_f16", "rms_rope_apply.comp", {{"CAST_F16", "1"}});
     string_to_spv("modulate_convrot", "modulate_convrot.comp", {});
     string_to_spv("rms_modulate_convrot", "modulate_convrot.comp", {{"RMS_AFFINE", "1"}});
 

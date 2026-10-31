@@ -878,8 +878,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
     vk_pipeline pipeline_rms_norm_128_f32;
-    vk_pipeline pipeline_rms_rope_apply_f32;
-    vk_pipeline pipeline_rms_rope_apply_f16;
     vk_pipeline pipeline_rms_norm_mul_128_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
@@ -953,7 +951,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large2_f32, pipeline_soft_max_large2_f32_f16;
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
 
-    vk_pipeline pipeline_rope_apply_f32;
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
@@ -1030,6 +1027,8 @@ struct vk_device_struct {
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
 
+    std::mutex extension_mutex;
+    std::map<std::vector<uint32_t>, vk_pipeline> extension_pipelines;
     std::vector<vk_pipeline_ref> all_pipelines;
 
     vk::Fence fence;
@@ -1253,6 +1252,16 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct ggml_vk_graph_batch {
+    const ggml_cgraph * graph = nullptr;
+    bool native_initialized = false;
+    uint32_t submitted_nodes = 0;
+    uint32_t submit_count = 0;
+    uint64_t batch_flops = 0;
+    uint64_t total_flops = 0;
+    uint64_t flops_per_submit = 0;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1271,6 +1280,7 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials;
 
     uint64_t last_total_flops {UINT64_MAX};
+    ggml_vk_graph_batch * extension_batch = nullptr;
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
@@ -1312,7 +1322,6 @@ struct ggml_backend_vk_context {
     bool fused_i8_swiglu_split = false;
     bool fused_i8_residual = false;
     bool fused_i8_row_concat = false;
-    bool fused_rms_rope_apply = false;
     bool fused_modulate_convrot = false;
     bool fused_swiglu_convrot = false;
     bool fused_sigmoid_convrot = false;

@@ -261,8 +261,7 @@ size_t ggml_vk_descriptor_offset(size_t tensor_offset, size_t alignment, size_t 
 uint32_t ggml_vk_concat_unit_size(ggml_type type);
 bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
-template <typename T>
-inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
+inline void ggml_vk_dispatch_pipeline_raw(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, vk::ArrayProxy<const vk::DescriptorBufferInfo> descriptor_buffer_infos, const void * constants, size_t constants_size, std::array<uint32_t, 3> elements) {
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
@@ -277,7 +276,7 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
-    GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
+    GGML_ASSERT(pipeline->push_constant_size == constants_size);
 
     const uint32_t descriptor_set_idx = ctx->descriptor_set_idx++;
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[descriptor_set_idx];
@@ -310,7 +309,9 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         bindings.assign(descriptor_buffer_infos.begin(), descriptor_buffer_infos.end());
     }
 
-    subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+    if (constants_size) {
+        subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, constants_size, constants);
+    }
     subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
     subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                 pipeline->layout,
@@ -323,3 +324,9 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     }
 }
 
+
+template <typename T>
+inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context * ctx, vk_context & subctx, vk_pipeline & pipeline,
+        std::initializer_list<vk::DescriptorBufferInfo> const & bindings, const T & constants, std::array<uint32_t, 3> elements) {
+    ggml_vk_dispatch_pipeline_raw(ctx, subctx, pipeline, bindings, push_constant_data(constants), push_constant_size(constants), elements);
+}
