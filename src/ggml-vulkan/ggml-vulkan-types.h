@@ -424,10 +424,11 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    uint32_t output_scale = 0x3f800000;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, output_scale) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.output_scale);
     }
 };
 
@@ -800,8 +801,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_quantize_i8_convrot_16384;
     vk_pipeline pipeline_sigmoid_quantize_i8_convrot_6144;
     vk_pipeline pipeline_fa_pad_kv;
-    vk_pipeline pipeline_modulate_convrot[2][2];
+    vk_pipeline pipeline_modulate_convrot[2][3];
+    vk_pipeline pipeline_rms_modulate_convrot;
     vk_pipeline pipeline_concat_cast_f16;
+    vk_pipeline pipeline_scale_cast_f16;
     vk_pipeline pipeline_mul_mat_i8_tensorwise;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
     vk_pipeline pipeline_mul_mat_i8_tensorwise_cm2;
@@ -876,6 +879,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_f32;
     vk_pipeline pipeline_rms_norm_128_f32;
     vk_pipeline pipeline_rms_rope_apply_f32;
+    vk_pipeline pipeline_rms_rope_apply_f16;
     vk_pipeline pipeline_rms_norm_mul_128_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
@@ -1307,11 +1311,14 @@ struct ggml_backend_vk_context {
     bool fused_i8_swiglu = false;
     bool fused_i8_swiglu_split = false;
     bool fused_i8_residual = false;
+    bool fused_i8_row_concat = false;
     bool fused_rms_rope_apply = false;
     bool fused_modulate_convrot = false;
     bool fused_swiglu_convrot = false;
     bool fused_sigmoid_convrot = false;
     bool fused_concat_cast_f16 = false;
+    bool fused_scale_cast_f16 = false;
+    bool fused_fa_scale = false;
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.

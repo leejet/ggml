@@ -10,6 +10,9 @@ layout(binding = 1) readonly buffer M { float data_m[]; };
 layout(binding = 2) readonly buffer H { float data_h[]; };
 layout(binding = 3) writeonly buffer D { uint data_d[]; };
 layout(binding = 4) writeonly buffer S { float data_s[]; };
+#ifdef RMS_AFFINE
+layout(binding = 5) readonly buffer W { float data_w[]; };
+#endif
 layout(push_constant) uniform parameter {
     uint rows;
     uint x_offset;
@@ -17,6 +20,7 @@ layout(push_constant) uniform parameter {
     uint h_offset;
     float eps;
     uint k;
+    uint w_offset;
 } p;
 shared float values[K];
 shared vec2 sums[512];
@@ -25,9 +29,42 @@ uint quantize(float value, float inv_scale) {
     return uint(clamp(int(roundEven(value * inv_scale)), -127, 127)) & 0xffu;
 }
 
+#ifdef RMS_AFFINE
+// Keep RMS arithmetic outside the scope of precise on the quantized output.
+float rms_row(uint row, uint tid) {
+    float sum = 0.0;
+    [[unroll]] for (uint col = tid, iter = 0; iter < 12; col += 512, ++iter) {
+        float x = 0.0;
+        if (col < p.k) {
+            x = data_x[p.x_offset + row * K + col];
+            values[col] = x;
+        }
+        sum += x * x;
+    }
+    sums[tid].x = sum;
+    barrier();
+    [[unroll]] for (uint stride = 256; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum += sums[tid + stride].x;
+            sums[tid].x = sum;
+        }
+        barrier();
+    }
+    return inversesqrt(sums[0].x / p.k + p.eps);
+}
+
+float rms_weight(float scale, float value, float weight) {
+    return scale * value * weight;
+}
+#endif
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     for (uint row = gl_WorkGroupID.x; row < p.rows; row += gl_NumWorkGroups.x) {
+#ifdef RMS_AFFINE
+        float inv_std = rms_row(row, tid);
+        float mean = 0.0;
+#else
         vec2 sum = vec2(0.0);
         [[unroll]] for (uint col = tid; col < K; col += 512) {
             const float x = data_x[p.x_offset + row * K + col];
@@ -51,8 +88,12 @@ void main() {
             const float variance = fma(-mean, mean, sums[0].y / p.k);
             inv_std = inversesqrt(variance + p.eps);
         }
+#endif
         [[unroll]] for (uint col = tid; col < K; col += 512) {
             precise float value;
+#ifdef RMS_AFFINE
+            values[col] = rms_weight(inv_std, values[col], data_w[p.w_offset + col]);
+#endif
             if (AFFINE) {
                 precise float modulated = values[col] * data_m[p.m_offset + col];
                 value = values[col] + modulated;

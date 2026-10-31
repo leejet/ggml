@@ -955,6 +955,7 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
     string_to_spv("concat_cast_f16", "concat_cast_f16.comp", {});
+    string_to_spv("scale_cast_f16", "scale_cast_f16.comp", {});
     string_to_spv("fa_pad_kv", "fa_pad_kv.comp", {});
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
@@ -1111,7 +1112,9 @@ void process_shaders() {
 
     string_to_spv("rope_apply_f32", "rope_apply.comp", {});
     string_to_spv("rms_rope_apply_f32", "rms_rope_apply.comp", {});
+    string_to_spv("rms_rope_apply_f16", "rms_rope_apply.comp", {{"CAST_F16", "1"}});
     string_to_spv("modulate_convrot", "modulate_convrot.comp", {});
+    string_to_spv("rms_modulate_convrot", "modulate_convrot.comp", {{"RMS_AFFINE", "1"}});
 
     string_to_spv("rope_norm_f32", "rope_norm.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
     string_to_spv("rope_norm_f16", "rope_norm.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});

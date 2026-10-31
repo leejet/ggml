@@ -26,6 +26,7 @@
 
 #include "types.glsl"
 #include "flash_attn_base.glsl"
+layout (constant_id = 16) const uint OutputScaleBits = 0x3f800000;
 #if !defined(BFLOAT16)
 #include "dequant_funcs_cm2.glsl"
 #endif
@@ -583,6 +584,12 @@ void main() {
 #if defined(ACC_TYPE_MAX)
     [[unroll]] for (uint i = 0; i < O_D.length(); ++i) { O_D[i] = clamp(O_D[i], D_TYPE(-ACC_TYPE_MAX), D_TYPE(ACC_TYPE_MAX)); }
 #endif
+
+    if ((Flags & 64) != 0) {
+        [[unroll]] for (uint k = 0; k < O_D.length(); ++k) {
+            O_D[k] = O_D[k] * uintBitsToFloat(OutputScaleBits) + 0.0;
+        }
+    }
 
     uint32_t o_offset = gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV;
 

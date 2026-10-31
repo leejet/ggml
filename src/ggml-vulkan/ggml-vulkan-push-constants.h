@@ -477,6 +477,7 @@ struct vk_op_rms_rope_apply_push_constants {
     vk_op_rope_apply_push_constants rope;
     float eps;
     uint32_t w_offset;
+    float output_scale;
 };
 
 struct vk_op_rope_push_constants {
@@ -895,12 +896,20 @@ struct vk_modulate_convrot_push_constants {
     uint32_t h_offset;
     float eps;
     uint32_t k;
+    uint32_t w_offset;
 };
 
 struct vk_concat_cast_f16_push_constants {
     uint32_t prefix, tokens, heads, batches;
     uint32_t a_stride[3], b_stride[3];
     uint32_t a_offset, b_offset, d_offset;
+};
+
+struct vk_scale_cast_f16_push_constants {
+    uint32_t columns, tokens, heads, batches;
+    uint32_t stride[3];
+    uint32_t x_offset, d_offset;
+    float scale, bias;
 };
 
 struct vk_mul_mat_i8_tensorwise_push_constants {

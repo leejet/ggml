@@ -1,0 +1,34 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer X { vec4 data_x[]; };
+layout(binding = 1) writeonly buffer D { f16vec4 data_d[]; };
+layout(push_constant) uniform parameter {
+    uint columns;
+    uint tokens;
+    uint heads;
+    uint batches;
+    uint stride[3];
+    uint x_offset;
+    uint d_offset;
+    float scale;
+    float bias;
+} p;
+
+void main() {
+    const uint item = gl_GlobalInvocationID.x;
+    const uint token = item / p.columns;
+    const uint col = item % p.columns;
+    if (token >= p.tokens) {
+        return;
+    }
+    for (uint hb = gl_WorkGroupID.y; hb < p.heads * p.batches; hb += gl_NumWorkGroups.y) {
+        const uint head = hb % p.heads;
+        const uint batch = hb / p.heads;
+        vec4 value = data_x[p.x_offset + batch * p.stride[2] + head * p.stride[1] + token * p.stride[0] + col] * p.scale + p.bias;
+        data_d[p.d_offset + (hb * p.tokens + token) * p.columns + col] = f16vec4(value);
+    }
+}
