@@ -1101,6 +1101,7 @@ struct vk_semaphore {
 };
 
 struct vk_event {
+    bool timeline_only = false;
     std::vector<vk::Event> events_free; // Events available for reuse
     std::vector<vk::Event> events_submitted; // Events that are fully submitted and can be reused on next synchronize
     vk::Event event;

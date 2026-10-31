@@ -4970,18 +4970,19 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         ggml_vk_load_shaders(device);
 
-        // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
+        // Keep weight prefetch off the compute queue on discrete AMD and NVIDIA devices.
         const bool prefers_transfer_queue =
-            device->vendor_id == VK_VENDOR_ID_AMD &&
-            device->architecture != AMD_GCN &&
             !device->uma &&
-            !allow_graphics_queue;
+            !allow_graphics_queue &&
+            ((device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) ||
+             device->vendor_id == VK_VENDOR_ID_NVIDIA);
 
         if (!device->single_queue) {
             const uint32_t transfer_queue_index = compute_queue_family_index == transfer_queue_family_index ? 1 : 0;
             device->transfer_queue = ggml_vk_create_queue(device, transfer_queue_family_index, transfer_queue_index, { vk::PipelineStageFlagBits::eTransfer }, true);
 
-            device->async_use_transfer_queue = prefers_transfer_queue || (getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr);
+            const char * use_transfer_queue = getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE");
+            device->async_use_transfer_queue = use_transfer_queue ? strcmp(use_transfer_queue, "0") != 0 : prefers_transfer_queue;
         } else {
             device->transfer_queue = ggml_vk_create_aliased_queue(device, device->compute_queue);
 
@@ -14013,9 +14014,14 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
         }
 
-        return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
-                                          vk_tensor_offset(dst) + dst->view_offs,
-                                          src->data, ggml_nbytes(src));
+        const bool copied = ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
+                                                       vk_tensor_offset(dst) + dst->view_offs,
+                                                       src->data, ggml_nbytes(src));
+        // Submit inputs before another backend can enqueue its next weight prefetch.
+        if (copied && ggml_vk_submit_transfer_ctx(ctx)) {
+            ctx->submit_pending = true;
+        }
+        return copied;
     }
 
     return false;
@@ -16272,6 +16278,19 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_event *vkev = (vk_event *)event->context;
 
+    // A transfer-only backend must not insert its completion wait ahead of unrelated compute work.
+    if (ctx->device->async_use_transfer_queue && ctx->compute_cmd_pool.cmd_buffers.empty() && !ctx->transfer_ctx.expired()) {
+        vk_context transfer_ctx = ctx->transfer_ctx.lock();
+        vkev->timeline_only = true;
+        vkev->tl_semaphore.value++;
+        transfer_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
+        vkev->cmd_buffer = transfer_ctx->s->buffer;
+        vkev->cmd_buffer_use_counter = vkev->cmd_buffer->use_counter;
+        ggml_vk_submit_transfer_ctx(ctx);
+        ctx->submit_pending = true;
+        return;
+    }
+    vkev->timeline_only = false;
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -16312,6 +16331,14 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
+    if (vkev->timeline_only) {
+        compute_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+        if (ctx->device->async_use_transfer_queue) {
+            vk_context transfer_ctx = ggml_vk_get_transfer_ctx(ctx);
+            transfer_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+        }
+        return;
+    }
     if (vkev->has_event) {
         // Wait for latest event
         ggml_vk_wait_events(compute_ctx, { vkev->event });
@@ -17298,7 +17325,7 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     vk_event *vkev = (vk_event *)event->context;
 
     // Only do something if the event has actually been used
-    if (vkev->has_event) {
+    if (vkev->tl_semaphore.value != 0) {
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
