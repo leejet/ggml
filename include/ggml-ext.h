@@ -51,6 +51,9 @@ struct ggml_ext_kernel_desc {
     bool (*supports)(ggml_backend_dev_t device, const struct ggml_tensor * node, void * user_data);
     bool (*preferred)(ggml_backend_dev_t device, const struct ggml_tensor * node, void * user_data);
     int (*match)(ggml_backend_dev_t device, const struct ggml_cgraph * graph, int first, void * user_data);
+    // Optional pre-allocation reordering. Preserve graph edges and tensor metadata;
+    // use ggml_ext_graph_delay to move independent producers safely.
+    void (*optimize)(ggml_backend_dev_t device, struct ggml_cgraph * graph, void * user_data);
     // prepare may run during measurement: host state only, no execution/device allocation.
     enum ggml_status (*prepare)(ggml_backend_t backend, struct ggml_tensor * const * nodes, int n_nodes,
                                void ** state, size_t * workspace_size, void * user_data);
@@ -64,6 +67,10 @@ struct ggml_ext_kernel_desc {
 // Register before querying device capabilities or allocating graphs. No unloading
 // or replacing registrations while graphs are alive. Higher priorities run first.
 GGML_API bool ggml_ext_register_kernel(ggml_backend_dev_t device, const struct ggml_ext_kernel_desc * desc);
+GGML_API bool ggml_ext_dev_supports_native_op(ggml_backend_dev_t device, const struct ggml_tensor * node);
+// Delay [first, first + count) until immediately before `before`. Refuses aliasing writes,
+// dependencies on the moved nodes, and unknown side effects in the crossed range.
+GGML_API bool ggml_ext_graph_delay(struct ggml_cgraph * graph, int first, int count, int before);
 
 // Query "ggml_ext_cuda_context_v1" through the CUDA registry's get_proc_address.
 // The returned stream is borrowed, ordered with native work, and must not be freed.

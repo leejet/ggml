@@ -169,6 +169,79 @@ struct ggml_ext_plan {
     uint64_t tail_uid;
 };
 
+bool ggml_ext_dev_supports_native_op(ggml_backend_dev_t device, const ggml_tensor * node) {
+    return device && node && !ggml_ext_op_get(node) && device->iface.supports_op(device, node);
+}
+
+static bool ggml_ext_is_view(const ggml_tensor * node) {
+    return node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+           node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+}
+
+static bool ggml_ext_is_pure(const ggml_tensor * node) {
+    if (node->view_src && !ggml_ext_is_view(node)) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_ADD: case GGML_OP_MUL: case GGML_OP_SCALE:
+        case GGML_OP_NORM: case GGML_OP_RMS_NORM: case GGML_OP_MUL_MAT:
+        case GGML_OP_UNARY: case GGML_OP_GLU: case GGML_OP_ROPE_APPLY:
+        case GGML_OP_FLASH_ATTN_EXT: case GGML_OP_QUANTIZE_I8_CONVROT:
+        case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+        case GGML_OP_CONT: case GGML_OP_CONCAT:
+            return true;
+        case GGML_OP_CUSTOM:
+            return ggml_ext_op_get(node) != nullptr;
+        default:
+            return false;
+    }
+}
+
+bool ggml_ext_graph_delay(ggml_cgraph * graph, int first, int count, int before) {
+    if (!graph || first < 0 || count < 1 || first > graph->n_nodes - count ||
+        before < first + count || before > graph->n_nodes) {
+        return false;
+    }
+    auto storage = [](const ggml_tensor * node) {
+        while (node && node->view_src) {
+            node = node->view_src;
+        }
+        return node;
+    };
+    for (int i = first; i < before; ++i) {
+        const auto * node = graph->nodes[i];
+        const bool copy = node->op == GGML_OP_CPY && node->view_src && i >= first + count;
+        if (!ggml_ext_is_pure(node) && !copy) {
+            return false;
+        }
+        if (copy) {
+            const auto * destination = storage(node);
+            for (int j = first; j < first + count; ++j) {
+                if (destination == storage(graph->nodes[j])) {
+                    return false;
+                }
+                for (const auto * src : graph->nodes[j]->src) {
+                    if (src && destination == storage(src)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if (i >= first + count) {
+            for (const auto * src : node->src) {
+                while (src) {
+                    if (std::find(graph->nodes + first, graph->nodes + first + count, src) != graph->nodes + first + count) {
+                        return false;
+                    }
+                    src = src->view_src;
+                }
+            }
+        }
+    }
+    std::rotate(graph->nodes + first, graph->nodes + first + count, graph->nodes + before);
+    return true;
+}
+
 static bool ggml_ext_can_fuse(const ggml_cgraph * graph, int first, int count) {
     if (count < 2 || count > graph->n_nodes - first) {
         return false;
@@ -177,22 +250,8 @@ static bool ggml_ext_can_fuse(const ggml_cgraph * graph, int first, int count) {
     std::vector<ggml_op> ops;
     for (int i = first; i < first + count; ++i) {
         const auto * node = graph->nodes[i];
-        if (node->view_src) {
+        if (!ggml_ext_is_pure(node) || (i == first + count - 1 && node->view_src)) {
             return false;
-        }
-        switch (node->op) {
-            case GGML_OP_ADD: case GGML_OP_MUL: case GGML_OP_SCALE:
-            case GGML_OP_NORM: case GGML_OP_RMS_NORM: case GGML_OP_MUL_MAT:
-            case GGML_OP_UNARY: case GGML_OP_GLU: case GGML_OP_ROPE_APPLY:
-            case GGML_OP_FLASH_ATTN_EXT: case GGML_OP_QUANTIZE_I8_CONVROT:
-                break;
-            case GGML_OP_CUSTOM:
-                if (ggml_ext_op_get(node)) {
-                    break;
-                }
-                return false;
-            default:
-                return false;
         }
         indices.push_back(i);
         ops.push_back(node->op);
@@ -216,6 +275,13 @@ ggml_ext_plan * ggml_ext_plan_create(ggml_backend_t backend, ggml_cgraph * graph
         ggml_ext_optimize_native(backend, graph, 0, graph->n_nodes, params);
         return nullptr;
     }
+    if (params && allow_fusion) {
+        for (const auto * kernel : kernels) {
+            if (kernel->desc.optimize) {
+                kernel->desc.optimize(backend->device, graph, kernel->desc.user_data);
+            }
+        }
+    }
     std::unique_ptr<ggml_ext_plan> plan(new ggml_ext_plan);
     plan->backend = backend;
     plan->tail_uid = ggml_graph_next_uid();
@@ -238,7 +304,7 @@ ggml_ext_plan * ggml_ext_plan_create(ggml_backend_t backend, ggml_cgraph * graph
                 }
             }
             if (!count && desc.supports && desc.supports(backend->device, node, desc.user_data)) {
-                const bool native = !ggml_ext_op_get(node) && backend->device->iface.supports_op(backend->device, node);
+                const bool native = ggml_ext_dev_supports_native_op(backend->device, node);
                 if (!native || !desc.preferred || desc.preferred(backend->device, node, desc.user_data)) {
                     count = 1;
                 }
