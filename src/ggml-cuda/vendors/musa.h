@@ -51,6 +51,7 @@
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaError_t musaError_t
+#define cudaErrorInvalidValue musaErrorInvalidValue
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled

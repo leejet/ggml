@@ -1181,6 +1181,7 @@ struct ggml_cuda_device_info {
 
     struct cuda_device_info {
         int     cc;                             // compute capability
+        int     max_threads_per_sm;
         int     nsm;                            // number of streaming multiprocessors
         size_t  smpb;                           // max. shared memory per block
         size_t  smpbo;                          // max. shared memory per block (with opt-in)

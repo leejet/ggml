@@ -93,58 +93,6 @@ GGML_API bool ggml_ext_dev_supports_native_op(ggml_backend_dev_t device, const s
 // dependencies on the moved nodes, and unknown side effects in the crossed range.
 GGML_API bool ggml_ext_graph_delay(struct ggml_cgraph * graph, int first, int count, int before);
 
-// Query "ggml_ext_cuda_context_v1" through the CUDA registry's get_proc_address.
-// The returned stream is borrowed, ordered with native work, and must not be freed.
-struct ggml_ext_cuda_context {
-    // Physical runtime ordinal, including when ggml exposes virtual devices.
-    int device;
-    void * stream;
-};
-typedef bool (*ggml_ext_cuda_context_fn)(ggml_backend_t backend, struct ggml_ext_cuda_context * context);
-// Query "ggml_ext_cuda_device_v1" during capability checks, before backend creation.
-// Returns the physical runtime ordinal, or -1 for a non-CUDA device.
-typedef int (*ggml_ext_cuda_device_fn)(ggml_backend_dev_t device);
-
-// Query "ggml_ext_cuda_blas_v1" during execute to borrow the current stream's
-// cuBLAS handle, with host scalar pointers. Do not retain/destroy it or change
-// its stream, pointer mode, math mode, or workspace. CUDA only.
-typedef void * (*ggml_ext_cuda_blas_fn)(ggml_backend_t backend);
-
-enum ggml_ext_gpu_kind {
-    GGML_EXT_GPU_CUDA,
-    GGML_EXT_GPU_HIP,
-    GGML_EXT_GPU_MUSA,
-};
-
-struct ggml_ext_gpu_device_info {
-    enum ggml_ext_gpu_kind kind;
-    int device;
-    int warp_size;
-    size_t shared_memory;
-    bool int8_blas;
-};
-// Query "ggml_ext_gpu_device_v1" for metadata without creating execution state.
-typedef bool (*ggml_ext_gpu_device_fn)(ggml_backend_dev_t device, struct ggml_ext_gpu_device_info * info);
-
-struct ggml_ext_gpu_context {
-    enum ggml_ext_gpu_kind kind;
-    int device;
-    void * stream;
-};
-// Query "ggml_ext_gpu_context_v1" during execution. The borrowed stream belongs
-// to the reported runtime; application kernels and runtime calls must use it.
-typedef bool (*ggml_ext_gpu_context_fn)(ggml_backend_t backend, struct ggml_ext_gpu_context * context);
-// Query "ggml_ext_gpu_blas_v1" to borrow the matching cuBLAS/hipBLAS/muBLAS
-// handle on that stream with host scalar pointers. Do not retain/destroy it or
-// change its stream, pointer mode, math mode, or workspace.
-typedef void * (*ggml_ext_gpu_blas_fn)(ggml_backend_t backend);
-
-
-// Query "ggml_ext_cpu_parallel_v1" to use the backend's configured thread pool.
-// The callback receives a temporary output descriptor; userdata can reference the
-// original nodes. Execution is synchronous and honors the CPU abort callback.
-typedef enum ggml_status (*ggml_ext_cpu_parallel_fn)(ggml_backend_t backend, struct ggml_tensor * output,
-                                                   ggml_custom_op_t callback, void * user_data);
 
 #ifdef __cplusplus
 }
