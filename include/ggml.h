@@ -603,8 +603,6 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_SOL_ATTN,
-
         GGML_OP_COUNT,
     };
 
@@ -2503,15 +2501,6 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
-
-    // Noncausal Sol-Attn: contiguous F32 Q/K/V [D=128, T, H, B], output [D, H, T, B].
-    GGML_API struct ggml_tensor* ggml_sol_attn(
-        struct ggml_context* ctx,
-        struct ggml_tensor* q,
-        struct ggml_tensor* k,
-        struct ggml_tensor* v,
-        float scale,
-        float tau);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

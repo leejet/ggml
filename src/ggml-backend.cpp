@@ -2258,7 +2258,6 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_SOL_ATTN:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_CUMSUM:
