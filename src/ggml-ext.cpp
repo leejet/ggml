@@ -123,14 +123,17 @@ bool ggml_ext_register_kernel(ggml_backend_dev_t device, const ggml_ext_kernel_d
     return true;
 }
 
-static std::vector<const ggml_ext_kernel *> ggml_ext_kernels(ggml_backend_dev_t device) {
+static std::vector<const ggml_ext_kernel *> ggml_ext_kernels(ggml_backend_dev_t device,
+                                                          ggml_op op = GGML_OP_COUNT, bool single_node = false) {
     auto & registry = ggml_ext_registry_get();
     std::lock_guard<std::mutex> lock(registry.mutex);
     std::vector<const ggml_ext_kernel *> result;
     auto it = registry.kernels.find(device);
     if (it != registry.kernels.end()) {
         for (const auto & kernel : it->second) {
-            result.push_back(kernel.get());
+            if ((op == GGML_OP_COUNT || kernel->desc.op == op) && (!single_node || kernel->desc.supports)) {
+                result.push_back(kernel.get());
+            }
         }
     }
     return result;
@@ -142,7 +145,10 @@ static bool ggml_ext_kernel_matches(const ggml_ext_kernel_desc & desc, const ggm
 }
 
 bool ggml_ext_dev_supports_op(ggml_backend_dev_t device, const ggml_tensor * node) {
-    for (const auto * kernel : ggml_ext_kernels(device)) {
+    if (node->op == GGML_OP_NONE || node->view_src) {
+        return false;
+    }
+    for (const auto * kernel : ggml_ext_kernels(device, node->op, true)) {
         const auto & desc = kernel->desc;
         if (ggml_ext_kernel_matches(desc, node) && desc.supports && desc.supports(device, node, desc.user_data)) {
             return true;
@@ -158,11 +164,11 @@ struct ggml_ext_step {
     const ggml_ext_kernel * kernel;
     void * state = nullptr;
     bool prepared = false;
-    ggml_backend_buffer_t workspace = nullptr;
     size_t workspace_size = 0;
 };
 
 struct ggml_ext_plan {
+    ggml_backend_buffer_t workspace = nullptr;
     ggml_backend_t backend;
     ggml_status status = GGML_STATUS_SUCCESS;
     std::vector<ggml_ext_step> steps;
@@ -363,8 +369,8 @@ void ggml_ext_plan_free(ggml_ext_plan * plan) {
         if (desc.destroy && step.prepared) {
             desc.destroy(step.state, desc.user_data);
         }
-        ggml_backend_buffer_free(step.workspace);
     }
+    ggml_backend_buffer_free(plan->workspace);
     delete plan;
 }
 
@@ -372,7 +378,7 @@ size_t ggml_ext_plan_workspace_size(const ggml_ext_plan * plan) {
     size_t size = 0;
     if (plan) {
         for (const auto & step : plan->steps) {
-            size += step.workspace_size;
+            size = std::max(size, step.workspace_size);
         }
     }
     return size;
@@ -382,12 +388,11 @@ ggml_status ggml_ext_plan_compute(ggml_ext_plan * plan, ggml_cgraph * graph) {
     if (plan->status != GGML_STATUS_SUCCESS) {
         return plan->status;
     }
-    for (auto & step : plan->steps) {
-        if (step.workspace_size && !step.workspace) {
-            step.workspace = ggml_backend_alloc_buffer(plan->backend, step.workspace_size);
-            if (!step.workspace) {
-                return GGML_STATUS_ALLOC_FAILED;
-            }
+    const size_t workspace_size = ggml_ext_plan_workspace_size(plan);
+    if (workspace_size && !plan->workspace) {
+        plan->workspace = ggml_backend_alloc_buffer(plan->backend, workspace_size);
+        if (!plan->workspace) {
+            return GGML_STATUS_ALLOC_FAILED;
         }
     }
     int first = 0;
@@ -401,7 +406,8 @@ ggml_status ggml_ext_plan_compute(ggml_ext_plan * plan, ggml_cgraph * graph) {
             }
         }
         const auto & desc = step.kernel->desc;
-        ggml_ext_execution_context context = { GGML_EXT_ABI_VERSION, plan->backend, step.workspace };
+        ggml_ext_execution_context context = { GGML_EXT_ABI_VERSION, plan->backend,
+                                              step.workspace_size ? plan->workspace : nullptr };
         auto status = desc.execute(&context, step.nodes.data(), (int) step.nodes.size(), step.state, desc.user_data);
         if (status != GGML_STATUS_SUCCESS) {
             return status;
