@@ -1,4 +1,3 @@
-#include "ggml-ext-gpu.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -361,7 +360,6 @@ static ggml_cuda_device_info ggml_cuda_init() {
         total_vram += device_vram;
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
         info.devices[id].nsm        = prop.multiProcessorCount;
-        info.devices[id].max_threads_per_sm = prop.maxThreadsPerMultiProcessor;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
 
@@ -6579,6 +6577,28 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_ext_context(ggml_backend_t backend, ggml_ext_cuda_context * context) {
+    if (!context || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    context->device = ggml_cuda_info().devices[ctx->device].physical_device;
+    context->stream = (void *) ctx->stream();
+    return true;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void * ggml_backend_cuda_ext_blas(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    return (void *) ctx->cublas_handle();
+}
+#endif
+
 static constexpr ggml_ext_gpu_kind ggml_backend_cuda_ext_kind() {
 #if defined(GGML_USE_HIP)
     return GGML_EXT_GPU_HIP;
@@ -6596,17 +6616,16 @@ static bool ggml_backend_cuda_ext_gpu_device(ggml_backend_dev_t device, ggml_ext
     auto * ctx = static_cast<ggml_backend_cuda_device_context *>(device->context);
     const auto & gpu = ggml_cuda_info().devices[ctx->device];
     *info = {ggml_backend_cuda_ext_kind(), gpu.physical_device, int(gpu.warp_size), size_t(gpu.smpbo),
-             ggml_cuda_i8_blas_available(gpu.cc), gpu.cc, gpu.nsm, gpu.max_threads_per_sm};
+             ggml_cuda_i8_blas_available(gpu.cc)};
     return true;
 }
 
 static bool ggml_backend_cuda_ext_gpu_context(ggml_backend_t backend, ggml_ext_gpu_context * context) {
-    if (!context || !backend || !ggml_backend_is_cuda(backend)) {
+    ggml_ext_cuda_context native;
+    if (!context || !ggml_backend_cuda_ext_context(backend, &native)) {
         return false;
     }
-    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
-    ggml_cuda_set_device(ctx->device);
-    *context = {ggml_backend_cuda_ext_kind(), ggml_cuda_info().devices[ctx->device].physical_device, (void *) ctx->stream()};
+    *context = {ggml_backend_cuda_ext_kind(), native.device, native.stream};
     return true;
 }
 
@@ -6617,6 +6636,14 @@ static void * ggml_backend_cuda_ext_gpu_blas(ggml_backend_t backend) {
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(ctx->device);
     return (void *) ctx->cublas_handle();
+}
+
+static int ggml_backend_cuda_ext_device(ggml_backend_dev_t device) {
+    if (!device || device->iface.get_name != ggml_backend_cuda_device_get_name) {
+        return -1;
+    }
+    auto * ctx = (ggml_backend_cuda_device_context *) device->context;
+    return ggml_cuda_info().devices[ctx->device].physical_device;
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -6634,6 +6661,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_ext_gpu_blas_v1") == 0) {
         return (void *) ggml_backend_cuda_ext_gpu_blas;
+    }
+    if (strcmp(name, "ggml_ext_cuda_context_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_context;
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_ext_cuda_blas_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_blas;
+    }
+#endif
+    if (strcmp(name, "ggml_ext_cuda_device_v1") == 0) {
+        return (void *) ggml_backend_cuda_ext_device;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

@@ -59,7 +59,6 @@
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
-#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorNotReady hipErrorNotReady
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
