@@ -34,6 +34,11 @@ layout (constant_id = 8) const uint MmABlockBytes = 2;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 #define IS_MUL_MM2 1
+#ifdef MUL_MAT_GATED_RESIDUAL
+#define OUTPUT_MATRIX_TYPE ACC_TYPE
+#else
+#define OUTPUT_MATRIX_TYPE D_TYPE
+#endif
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 256;
 layout (constant_id = 1) const uint BM = 64;
@@ -246,6 +251,23 @@ void load_row_ids(uint row_begin) {
 
 #ifdef MULMAT_QUANT
 #include "iq_shmem_init.glsl"
+#endif
+
+#ifdef MUL_MAT_GATED_RESIDUAL
+layout(binding = 3) readonly buffer Gate { float gate_value[]; };
+layout(binding = 4) readonly buffer Residual { float residual_value[]; };
+
+ACC_TYPE gated_residual(const uint r, const uint c, const ACC_TYPE value, const uint ir, const uint ic) {
+    const uint channel = ir * BM + r;
+    const uint row = ic * BN + c;
+    if (channel >= p.M || row >= p.N) {
+        return value;
+    }
+    precise float product = float(value) * gate_value[channel];
+    precise float result = residual_value[row * p.stride_d + channel] + product;
+    data_d[row * p.stride_d + channel] = result;
+    return ACC_TYPE(0);
+}
 #endif
 
 void main() {
@@ -464,9 +486,13 @@ void main() {
             [[unroll]] for (uint i = 0; i < sum.length(); ++i) { sum[i] = clamp(sum[i], -ACC_TYPE_MAX, ACC_TYPE_MAX); }
 #endif
 
-            coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator> mat_d = coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator>(sum);
+            coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator> mat_d = coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator>(sum);
 
+#ifdef MUL_MAT_GATED_RESIDUAL
+            coopMatPerElementNV(mat_d, mat_d, gated_residual, ir, ic);
+#else
             coopMatStoreTensorNV(mat_d, data_d, pos_d, sliceTensorLayoutNV(tensorLayoutD, ic * BN, BNover4, ir * BM, BM), tensorViewTranspose);
+#endif
             return;
         } else if (enable_smaller_matrices && ic * BN + BNover2 >= p.N) {
             coopmat<ACC_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator> sum = coopmat<ACC_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator>(0.0);
@@ -507,9 +533,13 @@ void main() {
             [[unroll]] for (uint i = 0; i < sum.length(); ++i) { sum[i] = clamp(sum[i], -ACC_TYPE_MAX, ACC_TYPE_MAX); }
 #endif
 
-            coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator> mat_d = coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator>(sum);
+            coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator> mat_d = coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator>(sum);
 
+#ifdef MUL_MAT_GATED_RESIDUAL
+            coopMatPerElementNV(mat_d, mat_d, gated_residual, ir, ic);
+#else
             coopMatStoreTensorNV(mat_d, data_d, pos_d, sliceTensorLayoutNV(tensorLayoutD, ic * BN, BNover2, ir * BM, BM), tensorViewTranspose);
+#endif
             return;
         } else {
             coopmat<ACC_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> sum = coopmat<ACC_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(0.0);
@@ -551,9 +581,13 @@ void main() {
             [[unroll]] for (uint i = 0; i < sum.length(); ++i) { sum[i] = clamp(sum[i], -ACC_TYPE_MAX, ACC_TYPE_MAX); }
 #endif
 
-            coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> mat_d = coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(sum);
+            coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> mat_d = coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(sum);
 
+#ifdef MUL_MAT_GATED_RESIDUAL
+            coopMatPerElementNV(mat_d, mat_d, gated_residual, ir, ic);
+#else
             coopMatStoreTensorNV(mat_d, data_d, pos_d, sliceTensorLayoutNV(tensorLayoutD, ic * BN, BN, ir * BM, BM), tensorViewTranspose);
+#endif
             return;
         }
     } else
@@ -612,8 +646,8 @@ void main() {
 #endif
 
             // Convert from ACC_TYPE to D_TYPE
-            coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator> mat_d;
-            mat_d = coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator>(sum);
+            coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator> mat_d;
+            mat_d = coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover4, gl_MatrixUseAccumulator>(sum);
 
             // Call callback to store each element, remapping row through shared memory
             coopMatPerElementNV(mat_d, mat_d, perElemOpD, ir, ic);
@@ -656,8 +690,8 @@ void main() {
 #endif
 
             // Convert from ACC_TYPE to D_TYPE
-            coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator> mat_d;
-            mat_d = coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator>(sum);
+            coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator> mat_d;
+            mat_d = coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BNover2, gl_MatrixUseAccumulator>(sum);
 
             // Call callback to store each element, remapping row through shared memory
             coopMatPerElementNV(mat_d, mat_d, perElemOpD, ir, ic);
@@ -708,14 +742,18 @@ void main() {
 #endif
 
         // Convert from ACC_TYPE to D_TYPE
-        coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> mat_d;
-        mat_d = coopmat<D_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(sum);
+        coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> mat_d;
+        mat_d = coopmat<OUTPUT_MATRIX_TYPE, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(sum);
 
 #ifdef MUL_MAT_ID
         // Call callback to store each element, remapping row through shared memory
         coopMatPerElementNV(mat_d, mat_d, perElemOpD, ir, ic);
 #else
+#ifdef MUL_MAT_GATED_RESIDUAL
+        coopMatPerElementNV(mat_d, mat_d, gated_residual, ir, ic);
+#else
         coopMatStoreTensorNV(mat_d, data_d, pos_d, sliceTensorLayoutNV(tensorLayoutD, ic * BN, BN, ir * BM, BM), tensorViewTranspose);
+#endif
 #endif
     }
 }
