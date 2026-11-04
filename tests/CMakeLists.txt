@@ -159,13 +159,6 @@ endif()
 # undefine NDEBUG so asserts don't get disabled in tests
 add_definitions(-UNDEBUG)
 
-if (GGML_CUDA)
-    enable_language(CUDA)
-    add_executable(test_sage_attn test_sage_attn.cpp test_sage_attn_helpers.cu)
-    target_link_libraries(test_sage_attn PRIVATE ggml)
-    add_test(NAME test_sage_attn COMMAND $<TARGET_FILE:test_sage_attn>)
-    set_tests_properties(test_sage_attn PROPERTIES SKIP_RETURN_CODE 77)
-endif()
 
 #
 # test-backend-ops
@@ -190,14 +183,6 @@ if (NOT GGML_BACKEND_DL)
     # test-fp8-matmul
 
     set(TEST_TARGET test-fp8-matmul)
-    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
-    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-
-    #
-    # test-int8-convrot
-
-    set(TEST_TARGET test-int8-convrot)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)

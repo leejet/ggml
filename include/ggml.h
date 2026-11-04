@@ -603,11 +603,6 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_QUANTIZE_I8_CONVROT,
-        GGML_OP_SAGE_ATTN,
-        GGML_OP_SOL_ATTN,
-        GGML_OP_ROPE_APPLY,
-
         GGML_OP_COUNT,
     };
 
@@ -1492,14 +1487,6 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-    GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * weight,
-            struct ggml_tensor  * input,
-            struct ggml_tensor  * weight_scale,
-            struct ggml_tensor  * bias,
-            int                   convrot_group_size);
-
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
@@ -1511,12 +1498,6 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
-
-    // Packs row-wise I8 activations followed by one F32 scale per row.
-    GGML_API struct ggml_tensor * ggml_quantize_i8_convrot(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   group_size);
 
     // indirect matrix multiplication
     //
@@ -1869,18 +1850,6 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 scale,
             float                 max_bias);
-
-    // Apply precomputed rotary matrices, with shapes in ne[] order:
-    // a: F32 [head_dim, heads, tokens, batch], pe: F32 [2, 2, rot_dim/2, tokens].
-    // pe stores [[cos, -sin], [sin, cos]] for each pair and token, shared across heads/batches.
-    // Returns contiguous F32 [head_dim, tokens, heads*batch]. Input strides are preserved.
-    // Interleaved pairs are (2*i, 2*i+1); otherwise pairs are (i, i+rot_dim/2).
-    // Channels from rot_dim to head_dim are copied unchanged.
-    GGML_API struct ggml_tensor * ggml_rope_apply(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            struct ggml_tensor  * pe,
-            bool                  interleaved);
 
     // rotary position embedding
     // if (mode & 1) - skip n_past elements (NOT SUPPORTED)
@@ -2532,31 +2501,6 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
-
-    enum ggml_sage_attn_mode {
-        GGML_SAGE_ATTN_AUTO = 0,
-        GGML_SAGE_ATTN_2,
-        GGML_SAGE_ATTN_2_PLUS_PLUS,
-    };
-
-    // Q/K: contiguous F32 [D, tokens, heads, batch], V: contiguous F16 in the same layout.
-    // Output: F32 [D, query heads, query tokens, batch]. CUDA-only, unmasked inference.
-    GGML_API struct ggml_tensor * ggml_sage_attn(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            float                 scale,
-            enum ggml_sage_attn_mode mode);
-
-    // Noncausal Sol-Attn: contiguous F32 Q/K/V [D=128, T, H, B], output [D, H, T, B].
-    GGML_API struct ggml_tensor* ggml_sol_attn(
-        struct ggml_context* ctx,
-        struct ggml_tensor* q,
-        struct ggml_tensor* k,
-        struct ggml_tensor* v,
-        float scale,
-        float tau);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

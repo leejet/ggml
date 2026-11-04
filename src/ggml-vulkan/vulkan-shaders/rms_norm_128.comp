@@ -1,0 +1,42 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 1) const bool do_multiply = false;
+
+void main() {
+    const uint row = gl_WorkGroupID.x * 4 + gl_SubgroupID;
+    if (row >= p.ne01) {
+        return;
+    }
+    const uint lane = gl_SubgroupInvocationID;
+    for (uint batch = gl_WorkGroupID.z; batch < p.ne03; batch += gl_NumWorkGroups.z) {
+        for (uint channel = gl_WorkGroupID.y; channel < p.ne02; channel += gl_NumWorkGroups.y) {
+            const uint a_offset = batch * p.nb03 + channel * p.nb02 + row * p.nb01 + get_aoffset();
+            const uint b_offset = src1_idx(0, row, channel, batch) + get_boffset();
+            const uint d_offset = ((batch * p.ne02 + channel) * p.ne01 + row) * 128 + get_doffset();
+            vec4 x = vec4(data_a[a_offset + lane], data_a[a_offset + lane + 32],
+                          data_a[a_offset + lane + 64], data_a[a_offset + lane + 96]);
+            precise vec4 squares = x * x;
+            // Match the shared-memory reduction tree before quantization amplifies rounding differences.
+            precise float sum = (squares.x + squares.z) + (squares.y + squares.w);
+            [[unroll]] for (uint stride = 16; stride > 0; stride >>= 1) {
+                sum += subgroupShuffle(sum, lane ^ stride);
+            }
+            sum = subgroupShuffle(sum, 0);
+            float scale = inversesqrt(sum / 128.0 + p.param1);
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                const uint col = lane + i * 32;
+                precise float value = scale * x[i];
+                if (do_multiply) {
+                    value *= data_b[b_offset + fastmod(col, p.ne10)];
+                }
+                data_d[d_offset + col] = value;
+            }
+        }
+    }
+}

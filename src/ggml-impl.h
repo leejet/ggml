@@ -182,27 +182,6 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
     ((float *)(tensor->op_params))[i] = value;
 }
 
-static inline bool ggml_mul_mat_has_packed_i8_input(const struct ggml_tensor * op) {
-    const struct ggml_tensor * weight = op->src[0];
-    const struct ggml_tensor * input  = op->src[1];
-    // MUL_MAT op_params[4] stores the packed activation's convrot group size, or zero for F32 input.
-    if (op->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(op, 4) <= 0 ||
-        weight == NULL || input == NULL || weight->type != GGML_TYPE_I8 || input->type != GGML_TYPE_I8 ||
-        op->type != GGML_TYPE_F32 || weight->ne[0] <= 0 || op->ne[0] != weight->ne[1] ||
-        !ggml_is_contiguous(input)) {
-        return false;
-    }
-
-    const int64_t rows        = ggml_nrows(op);
-    const int64_t rows_padded = GGML_PAD(rows, 4);
-    const int64_t scale_rows  = (rows * (int64_t) sizeof(float) + weight->ne[0] - 1) / weight->ne[0];
-    return input->ne[0] == weight->ne[0] && input->ne[1] == rows_padded + scale_rows &&
-           input->ne[2] == 1 && input->ne[3] == 1;
-}
-
-static inline const float * ggml_mul_mat_i8_input_scales(const struct ggml_tensor * op) {
-    return (const float *) ((const int8_t *) op->src[1]->data + op->src[0]->ne[0] * GGML_PAD(ggml_nrows(op), 4));
-}
 
 struct ggml_map_custom1_op_params {
     ggml_custom1_op_t  fun;

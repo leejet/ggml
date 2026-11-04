@@ -854,6 +854,7 @@ void process_shaders() {
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("rms_norm_128_f32", "rms_norm_128.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_mul_add_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_set_rows_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}));
@@ -953,12 +954,14 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+    string_to_spv("concat_cast_f16", "concat_cast_f16.comp", {});
+    string_to_spv("scale_cast_f16", "scale_cast_f16.comp", {});
+    string_to_spv("fa_pad_kv", "fa_pad_kv.comp", {});
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-    string_to_spv("quantize_i8_convrot", "quantize_i8_convrot.comp", {});
-    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise.comp", {});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    string_to_spv("mul_mat_i8_tensorwise", "mul_mat_i8_tensorwise_cm1.comp", {}, true, true);
+#endif
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
 #endif
 #endif
 
@@ -1073,7 +1076,7 @@ void process_shaders() {
     string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_f32",     "swiglu.comp",      {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("situ_f32", "situ.comp", { { "A_TYPE", "float" }, { "D_TYPE", "float" } });
-    string_to_spv("situ_f16", "situ.comp", { { "A_TYPE", "float" }, { "D_TYPE", "float16_t" }, { "SITU_PACK_F16", "1" } });
+    string_to_spv("situ_f16", "situ.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"SITU_PACK_F16", "1"}});
     string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_clamp_f16", "swiglu_clamp.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
@@ -1098,7 +1101,6 @@ void process_shaders() {
     string_to_spv("soft_max_large2_f32_f16", "soft_max_large2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_large3_f32_f16", "soft_max_large3.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
 
-    string_to_spv("rope_apply_f32", "rope_apply.comp", {});
 
     string_to_spv("rope_norm_f32", "rope_norm.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
     string_to_spv("rope_norm_f16", "rope_norm.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});

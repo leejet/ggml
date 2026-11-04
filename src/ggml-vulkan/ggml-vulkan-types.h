@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-vulkan.h"
+#include "ggml-ext-vulkan.h"
 
 #include <vulkan/vulkan_core.h>
 
@@ -424,10 +425,11 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    uint32_t output_scale = 0x3f800000;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, output_scale) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.output_scale);
     }
 };
 
@@ -529,7 +531,7 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
-static constexpr std::initializer_list<ggml_op> situ_matmul_pattern{ GGML_OP_GLU, GGML_OP_MUL_MAT };
+static constexpr std::initializer_list<ggml_op> situ_matmul_pattern{GGML_OP_GLU, GGML_OP_MUL_MAT};
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -660,6 +662,10 @@ class vk_memory_logger;
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
+    bool buffer_cache_enabled = false;
+    size_t buffer_cache_bytes = 0;
+    size_t backend_count = 0;
+    std::vector<vk_buffer> buffer_cache;
 
     // Guards compile_pending, all_pipelines, and the dynamic pipeline maps
     // (flash_attn, fa_mask_opt, solve_tri, conv2d, etc). The actual compile
@@ -728,6 +734,8 @@ struct vk_device_struct {
     // floor(log2(maxComputeWorkGroupInvocations))
     uint32_t max_workgroup_size_log2 {};
 
+    std::vector<ggml_ext_vulkan_matrix_properties> extension_matrix_properties;
+
     bool coopmat_support;
     bool coopmat_acc_f32_support {};
     bool coopmat_acc_f16_support {};
@@ -788,9 +796,9 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
-    vk_pipeline pipeline_quantize_i8_convrot;
-    vk_pipeline pipeline_mul_mat_i8_tensorwise;
-    vk_pipeline pipeline_mul_mat_i8_tensorwise_cm1;
+    vk_pipeline pipeline_fa_pad_kv;
+    vk_pipeline pipeline_concat_cast_f16;
+    vk_pipeline pipeline_scale_cast_f16;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -852,6 +860,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_128_f32;
+    vk_pipeline pipeline_rms_norm_mul_128_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -926,7 +936,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large2_f32, pipeline_soft_max_large2_f32_f16;
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
 
-    vk_pipeline pipeline_rope_apply_f32;
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
@@ -1003,6 +1012,8 @@ struct vk_device_struct {
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
 
+    std::mutex extension_mutex;
+    std::map<std::vector<uint32_t>, vk_pipeline> extension_pipelines;
     std::vector<vk_pipeline_ref> all_pipelines;
 
     vk::Fence fence;
@@ -1078,6 +1089,7 @@ struct vk_semaphore {
 };
 
 struct vk_event {
+    bool timeline_only = false;
     std::vector<vk::Event> events_free; // Events available for reuse
     std::vector<vk::Event> events_submitted; // Events that are fully submitted and can be reused on next synchronize
     vk::Event event;
@@ -1225,6 +1237,16 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct ggml_vk_graph_batch {
+    const ggml_cgraph * graph = nullptr;
+    bool native_initialized = false;
+    uint32_t submitted_nodes = 0;
+    uint32_t submit_count = 0;
+    uint64_t batch_flops = 0;
+    uint64_t total_flops = 0;
+    uint64_t flops_per_submit = 0;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1243,6 +1265,7 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials;
 
     uint64_t last_total_flops {UINT64_MAX};
+    ggml_vk_graph_batch * extension_batch = nullptr;
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
@@ -1280,6 +1303,9 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+    bool fused_concat_cast_f16 = false;
+    bool fused_scale_cast_f16 = false;
+    bool fused_fa_scale = false;
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
@@ -1290,7 +1316,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
-    ggml_tensor * fused_situ_matmul{};
+    ggml_tensor* fused_situ_matmul{};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

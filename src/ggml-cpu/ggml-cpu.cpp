@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-ext.h"
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
@@ -422,9 +423,6 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_SAGE_ATTN || op->op == GGML_OP_SOL_ATTN) {
-        return false;
-    }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
@@ -459,35 +457,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
             if (src0->type == GGML_TYPE_I8) {
-                const ggml_tensor * weight_scale = op->src[2];
-                const ggml_tensor * bias         = op->src[3];
-                const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
-                const bool packed_input          = ggml_mul_mat_has_packed_i8_input(op);
-                return (src1->type == GGML_TYPE_F32 || packed_input) && op->type == GGML_TYPE_F32 &&
-                       src0->ne[2] == 1 && src0->ne[3] == 1 &&
-                       ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
-                       (weight_scale == nullptr ||
-                        (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) &&
-                         ggml_nelements(weight_scale) == src0->ne[1])) &&
-                       (bias == nullptr ||
-                        (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
-                         ggml_nelements(bias) == src0->ne[1])) &&
-                       (convrot_group_size == 0 ||
-                        (convrot_group_size <= 256 && src0->ne[0] % convrot_group_size == 0));
+                return false;
             }
             // BF16 in src1 is widened into the F32 work buffer
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                    (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
-        case GGML_OP_ROPE_APPLY:
-            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
-        case GGML_OP_QUANTIZE_I8_CONVROT: {
-            const int group_size = ggml_get_op_params_i32(op, 0);
-            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
-                   group_size > 0 && group_size <= 256 && src0->ne[0] % group_size == 0;
-        }
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
@@ -684,7 +659,27 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static enum ggml_status ggml_backend_cpu_ext_parallel(ggml_backend_t backend, ggml_tensor * output,
+                                                      ggml_custom_op_t callback, void * user_data) {
+    if (!ggml_backend_is_cpu(backend) || !output || !callback) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_tensor node = *output;
+    ggml_custom_op_params params = { callback, GGML_N_TASKS_MAX, user_data };
+    node.op = GGML_OP_CUSTOM;
+    node.flags |= GGML_TENSOR_FLAG_COMPUTE;
+    memcpy(node.op_params, &params, sizeof(params));
+    ggml_tensor * nodes[] = { &node };
+    ggml_cgraph graph = {};
+    graph.n_nodes = 1;
+    graph.nodes = nodes;
+    return ggml_backend_cpu_graph_compute(backend, &graph);
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_ext_cpu_parallel_v1") == 0) {
+        return (void *) ggml_backend_cpu_ext_parallel;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

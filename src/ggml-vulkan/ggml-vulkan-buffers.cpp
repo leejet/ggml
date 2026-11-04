@@ -99,6 +99,15 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         nullptr,
     };
 
+    const std::array<uint32_t, 2> queue_families = {
+        device->compute_queue->queue_family_index,
+        device->transfer_queue ? device->transfer_queue->queue_family_index : device->compute_queue->queue_family_index,
+    };
+    if (device->async_use_transfer_queue && queue_families[0] != queue_families[1]) {
+        buffer_create_info.sharingMode = vk::SharingMode::eConcurrent;
+        buffer_create_info.setQueueFamilyIndices(queue_families);
+    }
+
     vk::ExternalMemoryBufferCreateInfo external_memory_bci;
     if (import_ptr) {
         external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;

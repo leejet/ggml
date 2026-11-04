@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-ext-impl.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -382,6 +383,7 @@ void ggml_backend_free(ggml_backend_t backend) {
         return;
     }
 
+    ggml_ext_backend_free(backend);
     backend->iface.free(backend);
 }
 
@@ -600,6 +602,12 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+    ggml_ext_plan * plan = ggml_ext_plan_create(backend, cgraph, nullptr, false);
+    if (plan) {
+        enum ggml_status status = ggml_ext_plan_compute(plan, cgraph);
+        ggml_ext_plan_free(plan);
+        return status;
+    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 
@@ -707,13 +715,6 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
-static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
-    GGML_ASSERT(backend);
-    if (backend->iface.graph_optimize != NULL) {
-        backend->iface.graph_optimize(backend, cgraph, params);
-    }
-}
-
 // Backend device
 
 const char * ggml_backend_dev_name(ggml_backend_dev_t device) {
@@ -773,6 +774,12 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if (ggml_ext_dev_supports_op(device, op)) {
+        return true;
+    }
+    if (ggml_ext_op_get(op)) {
+        return false;
+    }
     return device->iface.supports_op(device, op);
 }
 
@@ -921,6 +928,7 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+    struct ggml_ext_plan * ext_plan;
 };
 
 struct ggml_backend_sched {
@@ -1214,6 +1222,10 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    for (int i = 0; i < sched->n_splits; ++i) {
+        ggml_ext_plan_free(sched->splits[i].ext_plan);
+        sched->splits[i].ext_plan = nullptr;
+    }
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1625,7 +1637,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
 
-        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+        split->ext_plan = ggml_ext_plan_create(sched->backends[split->backend_id], &split->graph,
+                &opt_params, sched->n_copies == 1 && !sched->callback_eval);
     }
 
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
@@ -1903,7 +1916,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = split->ext_plan ? ggml_ext_plan_compute(split->ext_plan, &split->graph) :
+                split_backend->iface.graph_compute(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2028,6 +2042,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    for (int i = 0; i < sched->n_splits; ++i) {
+        ggml_ext_plan_free(sched->splits[i].ext_plan);
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2077,6 +2094,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    for (int i = 0; i < sched->n_splits; ++i) {
+        sizes[sched->splits[i].backend_id] += ggml_ext_plan_workspace_size(sched->splits[i].ext_plan);
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2206,7 +2226,13 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+    size_t size = ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+    for (int i = 0; i < sched->n_splits; ++i) {
+        if (sched->splits[i].backend_id == backend_index) {
+            size += ggml_ext_plan_workspace_size(sched->splits[i].ext_plan);
+        }
+    }
+    return size;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
@@ -2232,8 +2258,6 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_SAGE_ATTN:
-        case GGML_OP_SOL_ATTN:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_CUMSUM:
