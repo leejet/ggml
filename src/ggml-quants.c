@@ -660,11 +660,6 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-void dequantize_row_f8_e4m3(const ggml_fp8_e4m3_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    for (int64_t i = 0; i < k; ++i) {
-        y[i] = ggml_f8_e4m3_to_fp32(x[i].bits);
-    }
-}
 
 //
 // 2-6 bit quantization in super-blocks
