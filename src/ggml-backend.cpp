@@ -1620,17 +1620,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // optimize the split graphs and collect the allocation dependencies added by the backends
     // this needs to happen before we make graph_copy, so they are in sync
     // TODO: this may create many small allocations in the scheduler, restructure to use a flat array
-    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> alloc_deps;
+    struct {
+        std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> deps;
+        std::vector<ggml_tensor *> skipped;
+    } alloc_plan;
+    auto & alloc_deps = alloc_plan.deps;
 
     struct ggml_backend_graph_optimize_params opt_params = {
         /* .add_alloc_dep = */ [](void * user_data, ggml_tensor * tensor, ggml_tensor * until) {
-            auto & deps = *(std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> *) user_data;
+            auto & deps = static_cast<decltype(alloc_plan) *>(user_data)->deps;
             std::vector<ggml_tensor *> & keep = deps[until];
             if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) {
                 keep.push_back(tensor);
             }
         },
-        /* .user_data     = */ &alloc_deps,
+        /* .user_data     = */ &alloc_plan,
+        /* .skip_alloc    = */ [](void * user_data, ggml_tensor * tensor) {
+            static_cast<decltype(alloc_plan) *>(user_data)->skipped.push_back(tensor);
+        },
     };
 
     for (int i = 0; i < sched->n_splits; i++) {
@@ -1640,6 +1647,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->ext_plan = ggml_ext_plan_create(sched->backends[split->backend_id], &split->graph,
                 &opt_params, sched->n_copies == 1 && !sched->callback_eval);
     }
+    ggml_gallocr_set_skipped_tensors(sched->galloc, alloc_plan.skipped.data(), alloc_plan.skipped.size());
 
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
     int n_dep_nodes = 0;

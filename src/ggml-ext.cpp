@@ -544,6 +544,15 @@ ggml_ext_plan * ggml_ext_plan_create(ggml_backend_t backend, ggml_cgraph * graph
                             params->add_alloc_dep(params->user_data, src, step.nodes.back());
                         }
                     }
+                    // An in-place final output still needs its owning tensor and views.
+                    bool output_storage = false;
+                    for (auto * output = step.nodes.back(); output; output = output->view_src) {
+                        output_storage |= member == output;
+                    }
+                    if (params->skip_alloc && !output_storage && !member->data && !member->buffer &&
+                        !(member->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT))) {
+                        params->skip_alloc(params->user_data, member);
+                    }
                 }
             }
             plan->steps.push_back(std::move(step));

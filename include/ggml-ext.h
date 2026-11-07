@@ -45,6 +45,8 @@ struct ggml_ext_execution_context {
 // intermediates are allowed only when their storage is created within the match.
 // An in-place final node must overwrite that storage's complete layout without
 // external consumers of intermediate values.
+// Fused intermediates may have no data or buffer; execute must not access their
+// storage. Storage backing the final output is retained, including internal views.
 // A terminal CPY retains its write semantics; execute must handle input/output
 // storage overlap (including allocator reuse), using workspace when needed.
 // Returning zero declines.

@@ -469,6 +469,7 @@ struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
     size_t size_max; // 0 = pre-allocated, unused, or view
+    bool skipped;
 };
 
 struct leaf_alloc {
@@ -488,6 +489,7 @@ struct ggml_gallocr {
 
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
+    struct ggml_hash_set skipped_tensors;
 
     struct node_alloc * node_allocs; // [n_nodes]
     int n_nodes;
@@ -571,6 +573,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     }
 
     ggml_hash_set_free(&galloc->hash_set);
+    ggml_hash_set_free(&galloc->skipped_tensors);
     free(galloc->hash_values);
     free(galloc->bufts);
     free(galloc->buffers);
@@ -581,6 +584,24 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
+
+void ggml_gallocr_set_skipped_tensors(
+        ggml_gallocr_t galloc, struct ggml_tensor * const * tensors, size_t count) {
+    if (galloc->skipped_tensors.size < count + count / 4 + 1) {
+        ggml_hash_set_free(&galloc->skipped_tensors);
+        galloc->skipped_tensors = ggml_hash_set_new(count + count / 4 + 1);
+    }
+    ggml_hash_set_reset(&galloc->skipped_tensors);
+    for (size_t i = 0; i < count; ++i) {
+        GGML_ASSERT(tensors[i] && !tensors[i]->data && !tensors[i]->buffer);
+        GGML_ASSERT(!(tensors[i]->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)));
+        ggml_hash_find_or_insert(&galloc->skipped_tensors, tensors[i]);
+    }
+}
+
+static bool ggml_gallocr_is_skipped(ggml_gallocr_t galloc, struct ggml_tensor * tensor) {
+    return galloc->skipped_tensors.size && ggml_hash_contains(&galloc->skipped_tensors, tensor);
+}
 
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {
     size_t i = ggml_hash_find_or_insert(&galloc->hash_set, t);
@@ -623,6 +644,9 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
 
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
+    if (ggml_gallocr_is_skipped(galloc, node)) {
+        return;
+    }
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
@@ -863,7 +887,8 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
-        if (node->view_src || node->data) {
+        node_alloc->dst.skipped = ggml_gallocr_is_skipped(galloc, node);
+        if (node->view_src || node->data || node_alloc->dst.skipped) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
             node_alloc->dst.size_max = 0;
@@ -875,7 +900,8 @@ static bool ggml_gallocr_reserve_n_impl(
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
-            if (!src || src->view_src || src->data) {
+            node_alloc->src[j].skipped = src && ggml_gallocr_is_skipped(galloc, src);
+            if (!src || src->view_src || src->data || node_alloc->src[j].skipped) {
                 node_alloc->src[j].buffer_id = -1;
                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
                 node_alloc->src[j].size_max = 0;
@@ -896,7 +922,8 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
-        if (leaf->view_src || leaf->data) {
+        galloc->leaf_allocs[i].leaf.skipped = ggml_gallocr_is_skipped(galloc, leaf);
+        if (leaf->view_src || leaf->data || galloc->leaf_allocs[i].leaf.skipped) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
             galloc->leaf_allocs[i].leaf.size_max = 0;
@@ -974,6 +1001,9 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 }
 
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+    if (tensor_alloc->skipped) {
+        return;
+    }
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
@@ -1001,6 +1031,13 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
 }
 
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+    const bool skipped = ggml_gallocr_is_skipped(galloc, node);
+    if (skipped != talloc->skipped) {
+        return false;
+    }
+    if (skipped) {
+        return true;
+    }
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
@@ -1025,6 +1062,12 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
         return true;
+    }
+
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        if (!ggml_gallocr_node_needs_realloc(galloc, graph->leafs[i], &galloc->leaf_allocs[i].leaf)) {
+            return true;
+        }
     }
 
     for (int i = 0; i < graph->n_nodes; i++) {

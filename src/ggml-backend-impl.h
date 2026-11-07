@@ -117,6 +117,11 @@ extern "C" {
         // can be called multiple times for the same tensor: the longest lifetime applies
         void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
         void * user_data;
+        // Optional: omit storage for a fused intermediate. The tensor must have no
+        // existing allocation, external consumers, input/output flags, or storage
+        // needed by the output.
+        // Preserve external input lifetimes with add_alloc_dep.
+        void (*skip_alloc)(void * user_data, struct ggml_tensor * tensor);
     };
 
     struct ggml_backend_i {
