@@ -2864,7 +2864,8 @@ static webgpu_encoded_op ggml_webgpu_glu(webgpu_context & ctx,
     std::vector<uint32_t> params = {
         offset_src0,
         offset_src1,
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        decisions->inplace ? offset_src0 :
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
         (uint32_t) (src0->nb[1] / ggml_type_size(src0->type)),
         (uint32_t) (src0->nb[2] / ggml_type_size(src0->type)),
         (uint32_t) (src0->nb[3] / ggml_type_size(src0->type)),
@@ -2898,7 +2899,9 @@ static webgpu_encoded_op ggml_webgpu_glu(webgpu_context & ctx,
         dst_binding = 2;
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src1));
     }
-    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, dst_binding, dst));
+    if (!decisions->inplace) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, dst_binding, dst));
+    }
 
     uint32_t wg_x;
     uint32_t wg_y;

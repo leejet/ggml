@@ -121,6 +121,7 @@ struct ggml_webgpu_binary_shader_decisions {
 
 struct ggml_webgpu_glu_shader_decisions {
     uint32_t wg_size     = 0;
+    bool     inplace     = false;
     bool     src_overlap = false;
 };
 
@@ -1120,10 +1121,12 @@ struct ggml_webgpu_glu_pipeline_key {
     ggml_glu_op glu_op;
     ggml_type   type;
     bool        split;
+    bool        inplace;
     bool        src_overlap;
 
     bool operator==(const ggml_webgpu_glu_pipeline_key & other) const {
-        return glu_op == other.glu_op && type == other.type && split == other.split && src_overlap == other.src_overlap;
+        return glu_op == other.glu_op && type == other.type && split == other.split && inplace == other.inplace &&
+               src_overlap == other.src_overlap;
     }
 };
 
@@ -1133,6 +1136,7 @@ struct ggml_webgpu_glu_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.glu_op);
         ggml_webgpu_hash_combine(seed, key.type);
         ggml_webgpu_hash_combine(seed, key.split);
+        ggml_webgpu_hash_combine(seed, key.inplace);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
         return seed;
     }
@@ -3166,6 +3170,7 @@ class ggml_webgpu_shader_lib {
         key.glu_op                       = ggml_get_glu_op(context.dst);
         key.type                         = context.dst->type;
         key.split                        = (context.src1 != nullptr);
+        key.inplace                      = key.split && ggml_webgpu_tensor_equal(context.src0, context.dst);
         key.src_overlap                  = src_overlap;
 
         auto it = glu_pipelines.find(key);
@@ -3232,9 +3237,15 @@ class ggml_webgpu_shader_lib {
 
         defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
 
+        if (key.inplace) {
+            defines.push_back("INPLACE");
+            variant += "_inplace";
+        }
+
         auto processed           = preprocessor.preprocess(wgsl_glu, defines);
         auto decisions           = std::make_shared<ggml_webgpu_glu_shader_decisions>();
         decisions->wg_size       = context.max_wg_size;
+        decisions->inplace       = key.inplace;
         decisions->src_overlap   = key.src_overlap;
         webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context         = decisions;

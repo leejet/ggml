@@ -35,6 +35,7 @@ bool ggml_op_can_inplace(enum ggml_op op) {
         case GGML_OP_SQRT:
         case GGML_OP_LOG:
         case GGML_OP_UNARY:
+        case GGML_OP_GLU:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_SILU_BACK:
@@ -631,6 +632,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         // try to reuse a parent's buffer (inplace)
         if (ggml_op_can_inplace(node->op)) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
+                // Some GLU backends activate into dst before reading the value input.
+                // Only reuse the gate; the layout check also excludes packed GLU.
+                if (node->op == GGML_OP_GLU && i != 0) {
+                    continue;
+                }
                 struct ggml_tensor * parent = node->src[i];
                 if (parent == NULL) {
                     continue;

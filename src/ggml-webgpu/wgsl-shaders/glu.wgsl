@@ -105,11 +105,16 @@ struct Params {
 var<storage, read_write> src0: array<DataType>;
 
 #ifdef SRC_OVERLAP
+#ifdef INPLACE
+@group(0) @binding(1)
+var<uniform> params: Params;
+#else
 @group(0) @binding(1)
 var<storage, read_write> dst: array<DataType>;
 
 @group(0) @binding(2)
 var<uniform> params: Params;
+#endif
 
 fn a_value(base: u32) -> DataType {
     return src0[base];
@@ -140,11 +145,16 @@ fn b_value(base: u32) -> DataType {
 @group(0) @binding(1)
 var<storage, read_write> src1: array<DataType>;
 
+#ifdef INPLACE
+@group(0) @binding(2)
+var<uniform> params: Params;
+#else
 @group(0) @binding(2)
 var<storage, read_write> dst: array<DataType>;
 
 @group(0) @binding(3)
 var<uniform> params: Params;
+#endif
 
 fn a_value(base: u32) -> DataType {
     return src0[base];
@@ -177,5 +187,9 @@ fn main(@builtin(num_workgroups) num_wg: vec3<u32>,
     let i_b = params.offset_src1 + i3 * params.stride_src13 + i2 * params.stride_src12 + i1 * params.stride_src11 + i0;
     let i_dst = params.offset_dst + i3 * params.stride_dst3 + i2 * params.stride_dst2 + i1 * params.stride_dst1 + i0;
 
+#ifdef INPLACE
+    src0[i_dst] = op(a_value(i_a), b_value(i_b));
+#else
     dst[i_dst] = op(a_value(i_a), b_value(i_b));
+#endif
 }
