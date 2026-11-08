@@ -70,7 +70,7 @@ struct ggml_metal {
 
     // buffers to release after async Metal operations complete
     // if Metal released them, it would do so on a Metal-internal thread without an autorelease pool, which could cause leaks
-    NSMutableArray * buf_refs;
+    NSMapTable * buf_refs;
 
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
@@ -182,7 +182,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         }
 
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
-        res->buf_refs     = [[NSMutableArray alloc] init];
+        res->buf_refs     = [[NSMapTable strongToStrongObjectsMapTable] retain];
 
         res->cmd_buf_last = nil;
 
@@ -251,6 +251,31 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+static void ggml_metal_reap_completed(ggml_metal_t ctx) {
+    @autoreleasepool {
+        NSUInteger count = 0;
+        for (id<MTLCommandBuffer> cmd_buf in ctx->cmd_bufs_ext) {
+            MTLCommandBufferStatus status = [cmd_buf status];
+            if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) {
+                break;
+            }
+            if (status == MTLCommandBufferStatusError) {
+                GGML_LOG_ERROR("%s: error: %s\n", __func__, [[cmd_buf error].localizedDescription UTF8String]);
+                ctx->has_error = true;
+            }
+            if (ctx->cmd_buf_last == cmd_buf) {
+                ctx->cmd_buf_last = nil;
+            }
+            // Event-only users may never synchronize the backend. Release each
+            // temporary buffer only after its own transfer has finished.
+            [ctx->buf_refs removeObjectForKey:cmd_buf];
+            [cmd_buf release];
+            ++count;
+        }
+        [ctx->cmd_bufs_ext removeObjectsInRange:NSMakeRange(0, count)];
+    }
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
@@ -280,40 +305,11 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
     }
 
-    // release any completed extra command buffers
-    if (ctx->cmd_bufs_ext.count > 0) {
-        for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
-            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
-
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
-
-                // release this and all remaining command buffers before returning
-                for (size_t j = i; j < ctx->cmd_bufs_ext.count; ++j) {
-                    [ctx->cmd_bufs_ext[j] release];
-                }
-                [ctx->cmd_bufs_ext removeAllObjects];
-
-                ctx->has_error = true;
-                return;
-            }
-
-            [cmd_buf release];
-        }
-
-        [ctx->cmd_bufs_ext removeAllObjects];
-    }
-
-    @autoreleasepool {
-        [ctx->buf_refs removeAllObjects];
-    }
+    ggml_metal_reap_completed(ctx);
 }
 
 enum ggml_status ggml_metal_ext_submit(ggml_metal_t ctx, ggml_ext_metal_encode_fn encode, void * user_data) {
+    ggml_metal_reap_completed(ctx);
     if (ctx->has_error || !encode) {
         return GGML_STATUS_FAILED;
     }
@@ -349,6 +345,7 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_metal_reap_completed(ctx);
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
@@ -380,7 +377,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         [encoder endEncoding];
         [cmd_buf commit];
 
-        [ctx->buf_refs addObject:buf_src];
+        [ctx->buf_refs setObject:buf_src forKey:cmd_buf];
         [buf_src release];
 
         // do not wait here for completion
@@ -395,6 +392,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_metal_reap_completed(ctx);
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
@@ -426,7 +424,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         [encoder endEncoding];
         [cmd_buf commit];
 
-        [ctx->buf_refs addObject:buf_dst];
+        [ctx->buf_refs setObject:buf_dst forKey:cmd_buf];
         [buf_dst release];
 
         // do not wait here for completion
@@ -441,6 +439,8 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 }
 
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_metal_reap_completed(ctx_src);
+    ggml_metal_reap_completed(ctx_dst);
     @autoreleasepool {
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
         struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
@@ -497,6 +497,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    ggml_metal_reap_completed(ctx);
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -695,6 +696,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 }
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    ggml_metal_reap_completed(ctx);
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
@@ -711,6 +713,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 }
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    ggml_metal_reap_completed(ctx);
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
