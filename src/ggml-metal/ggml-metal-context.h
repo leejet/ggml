@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-metal-device.h"
+#include "ggml-ext-metal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,7 @@ void ggml_metal_free(ggml_metal_t ctx);
 const char * ggml_metal_get_name(ggml_metal_t ctx);
 
 void ggml_metal_synchronize(ggml_metal_t ctx);
+enum ggml_status ggml_metal_ext_submit(ggml_metal_t ctx, ggml_ext_metal_encode_fn encode, void * user_data);
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);

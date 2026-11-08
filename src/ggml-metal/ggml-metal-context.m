@@ -313,6 +313,31 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     }
 }
 
+enum ggml_status ggml_metal_ext_submit(ggml_metal_t ctx, ggml_ext_metal_encode_fn encode, void * user_data) {
+    if (ctx->has_error || !encode) {
+        return GGML_STATUS_FAILED;
+    }
+    if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
+        return GGML_STATUS_ABORTED;
+    }
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        if (!command) {
+            return GGML_STATUS_FAILED;
+        }
+        enum ggml_status status = encode(command, user_data);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        [command retain];
+        [ctx->cmd_bufs_ext addObject:command];
+        [command commit];
+        ctx->cmd_buf_last = command;
+        return GGML_STATUS_SUCCESS;
+    }
+}
+
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
     if (!t) {
         return (struct ggml_metal_buffer_id) { nil, 0 };

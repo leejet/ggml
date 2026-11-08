@@ -570,13 +570,13 @@ static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_e
 static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(params && params->add_alloc_dep);
 
-    // keep the MoE weighted-reduction inputs alive until the fused output so the
-    // allocator cannot reuse them while the fused kernel is still reading them
-    ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
-
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     ggml_metal_graph_optimize(ctx, cgraph);
+
+    // Collect dependencies after reordering: raw fusion patterns can break up,
+    // moving their last node ahead of an input's producer.
+    ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
 }
 
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
@@ -945,7 +945,52 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+static void * ggml_backend_metal_ext_device(ggml_backend_dev_t device) {
+    if (!device || device->iface.get_name != ggml_backend_metal_device_get_name) {
+        return nullptr;
+    }
+    return ggml_metal_device_get_obj((ggml_metal_device_t) device->context);
+}
+
+static bool ggml_backend_metal_ext_buffer(ggml_backend_buffer_t buffer, size_t offset, size_t size,
+                                         ggml_ext_metal_buffer * result) {
+    if (!buffer || !result || !size || size > INT64_MAX || !ggml_backend_buffer_is_metal(buffer) ||
+        offset > buffer->size || size > buffer->size - offset) {
+        return false;
+    }
+    ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_I8;
+    tensor.data = (char *) ggml_backend_buffer_get_base(buffer) + offset;
+    tensor.ne[0] = size;
+    tensor.nb[0] = 1;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        tensor.ne[i] = 1;
+        tensor.nb[i] = size;
+    }
+    const auto binding = ggml_metal_buffer_get_id((ggml_metal_buffer_t) buffer->context, &tensor);
+    result->buffer = binding.metal;
+    result->offset = binding.offs;
+    return result->buffer != nullptr;
+}
+
+static ggml_status ggml_backend_metal_ext_submit(ggml_backend_t backend,
+                                               ggml_ext_metal_encode_fn encode, void * user_data) {
+    if (!backend || !ggml_backend_is_metal(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+    return ggml_metal_ext_submit((ggml_metal_t) backend->context, encode, user_data);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_ext_metal_device_v1") == 0) {
+        return (void *) ggml_backend_metal_ext_device;
+    }
+    if (strcmp(name, "ggml_ext_metal_buffer_v1") == 0) {
+        return (void *) ggml_backend_metal_ext_buffer;
+    }
+    if (strcmp(name, "ggml_ext_metal_submit_v1") == 0) {
+        return (void *) ggml_backend_metal_ext_submit;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
