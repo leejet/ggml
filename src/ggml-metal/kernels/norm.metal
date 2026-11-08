@@ -241,18 +241,21 @@ kernel void kernel_group_norm_f32(
         device const float * src0,
         device       float * dst,
         threadgroup float  * buf [[threadgroup(0)]],
-        uint tgpig[[threadgroup_position_in_grid]],
-        uint tpitg[[thread_position_in_threadgroup]],
-        uint sgitg[[simdgroup_index_in_threadgroup]],
-        uint tiisg[[thread_index_in_simdgroup]],
-        uint   ntg[[threads_per_threadgroup]]) {
+        uint2 tgpig[[threadgroup_position_in_grid]],
+        uint2 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint2   ntg[[threads_per_threadgroup]]) {
     const int64_t ne = args.ne00*args.ne01*args.ne02;
     const int64_t gs = args.ne00*args.ne01*((args.ne02 + args.ngrp - 1) / args.ngrp);
 
-    int start = tgpig * gs;
+    src0 += tgpig.y * ne;
+    dst  += tgpig.y * ne;
+
+    int start = tgpig.x * gs;
     int end   = start + gs;
 
-    start += tpitg;
+    start += tpitg.x;
 
     if (end >= ne) {
         end = ne;
@@ -260,13 +263,13 @@ kernel void kernel_group_norm_f32(
 
     float tmp = 0.0f; // partial sum for thread in warp
 
-    for (int j = start; j < end; j += ntg) {
+    for (int j = start; j < end; j += ntg.x) {
         tmp += src0[j];
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     tmp = simd_sum(tmp);
-    if (ntg > N_SIMDWIDTH) {
+    if (ntg.x > N_SIMDWIDTH) {
         if (sgitg == 0) {
             buf[tiisg] = 0.0f;
         }
@@ -286,14 +289,14 @@ kernel void kernel_group_norm_f32(
     const float mean = tmp / gs;
     tmp = 0.0f;
 
-    for (int j = start; j < end; j += ntg) {
+    for (int j = start; j < end; j += ntg.x) {
         float xi = src0[j] - mean;
         dst[j] = xi;
         tmp += xi * xi;
     }
 
     tmp = simd_sum(tmp);
-    if (ntg > N_SIMDWIDTH) {
+    if (ntg.x > N_SIMDWIDTH) {
         if (sgitg == 0) {
             buf[tiisg] = 0.0f;
         }
@@ -312,7 +315,7 @@ kernel void kernel_group_norm_f32(
 
     const float variance = tmp / gs;
     const float scale = 1.0f/sqrt(variance + args.eps);
-    for (int j = start; j < end; j += ntg) {
+    for (int j = start; j < end; j += ntg.x) {
         dst[j] *= scale;
     }
 }
