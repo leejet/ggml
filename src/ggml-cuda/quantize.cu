@@ -452,13 +452,27 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     GGML_UNUSED(n_expert_used);
 }
 
-// scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
-static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
-        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+static __device__ __forceinline__ float situ_quantize_value(float g, float h) {
+    const float a       = __fmul_rn(tanhf(__fmul_rn(0.25f, g)), 4.0f);
+    const float b       = __fmul_rn(tanhf(__fmul_rn(1.0f / 25.0f, h)), 25.0f);
+    const float sigmoid = 1.0f / (1.0f + expf(-g));
+    return __fmul_rn(__fmul_rn(a, sigmoid), b);
+}
 
+// scatter: grid over tokens, quantize once, write to all the token's compact rows
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool situ = false>
+static __global__ void quantize_mmq_q8_1(const float * __restrict__ x,
+                                         const int32_t * __restrict__ ids,
+                                         void * __restrict__ vy,
+                                         const int64_t ne00,
+                                         const int64_t s01,
+                                         const int64_t s02,
+                                         const int64_t s03,
+                                         const int64_t ne0,
+                                         const int     ne1,
+                                         const int     ne2,
+                                         const int     n_expert_used,
+                                         const float * up = nullptr) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
@@ -488,7 +502,14 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = i0 < ne00 ? x4[(base_idx + i00) / 4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if constexpr (situ) {
+        if (i0 < ne00) {
+            const float4 h = reinterpret_cast<const float4 *>(up)[(base_idx + i00) / 4];
+            xi             = make_float4(situ_quantize_value(xi.x, h.x), situ_quantize_value(xi.y, h.y),
+                                         situ_quantize_value(xi.z, h.z), situ_quantize_value(xi.w, h.w));
+        }
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -552,6 +573,19 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
     GGML_UNUSED(n_expert_used);
+}
+
+void quantize_situ_mmq_q8_1_cuda(const ggml_tensor * activation, void * output, int64_t padded, cudaStream_t stream) {
+    const ggml_tensor * packed  = activation->src[0];
+    const int64_t       columns = activation->ne[0];
+    const bool          swapped = ggml_get_op_params_i32(activation, 1) != 0;
+    const float *       gate    = static_cast<const float *>(packed->data) + (swapped ? columns : 0);
+    const float *       up      = static_cast<const float *>(packed->data) + (swapped ? 0 : columns);
+    const dim3          blocks(activation->ne[1],
+                               (padded + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ));
+    quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<blocks, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, stream>>>(
+        gate, nullptr, output, columns, packed->nb[1] / sizeof(float), packed->nb[2] / sizeof(float),
+        packed->nb[3] / sizeof(float), padded, activation->ne[1], 1, 0, up);
 }
 
 void quantize_row_q8_1_cuda(
