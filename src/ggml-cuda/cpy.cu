@@ -480,10 +480,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
     } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F16) {
         if (contiguous_srcs) {
-            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_cuda, half>
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_t, half>
                 (src0_ddc, src1_ddc, ne, main_stream);
         } else {
-            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_cuda, half>
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_t, half>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F8_E5M2 && src1->type == GGML_TYPE_F16) {
@@ -496,10 +496,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         }
     } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_BF16) {
         if (contiguous_srcs) {
-            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_cuda, nv_bfloat16>
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_t, nv_bfloat16>
                 (src0_ddc, src1_ddc, ne, main_stream);
         } else {
-            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_cuda, nv_bfloat16>
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_t, nv_bfloat16>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F8_E5M2 && src1->type == GGML_TYPE_BF16) {
@@ -508,6 +508,41 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, main_stream);
         } else {
             ggml_cpy_scalar_cuda<ggml_fp8_e5m2_cuda, nv_bfloat16>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F8_E4M3) {
+        ggml_cpy_scalar_cuda<uint8_t, uint8_t>
+            (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F8_E4M3) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<float, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<float, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F8_E4M3) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<half, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<half, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F8_E4M3) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<nv_bfloat16, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<nv_bfloat16, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F32) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_t, float>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_t, float>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {

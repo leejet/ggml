@@ -50,7 +50,7 @@ static bool test_type(ggml_backend_t backend, ggml_type type) {
 
     ggml_tensor * native = ggml_mul_mat(ctx, weight, input);
     ggml_tensor * precise = ggml_mul_mat(ctx, weight, input);
-    ggml_mul_mat_set_prec(precise, GGML_PREC_F32);
+    ggml_prec_set_acc(precise, GGML_PREC_F32);
     ggml_set_output(native);
     ggml_set_output(precise);
 
